@@ -10,6 +10,10 @@ python (Join-Path $Root "cfw_alert_center_triage.py") --days 2 2>&1 | Out-File -
 if ($LASTEXITCODE -ne 0) {
     "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] alert center backlog triage exit=$LASTEXITCODE" | Out-File -FilePath $LogFile -Append -Encoding utf8
 }
+python (Join-Path $Root "attacker_profile.py") --days 2 2>&1 | Out-File -FilePath $LogFile -Append -Encoding utf8
+if ($LASTEXITCODE -ne 0) {
+    "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] attacker profile exit=$LASTEXITCODE" | Out-File -FilePath $LogFile -Append -Encoding utf8
+}
 python (Join-Path $Root "cfw_alert_monitor.py") report --refresh 2>&1 | Out-File -FilePath $LogFile -Append -Encoding utf8
 $ExitCode = $LASTEXITCODE
 $Stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
