@@ -40,6 +40,10 @@ SAFE_SCAN_KEYWORDS = (
     "censys",
     "paloalto",
 )
+# Only codes that genuinely mean "the attack did not land" count as明显失败.
+# 5xx is deliberately excluded: RCE / SQLi / memory-shell loading can crash the
+# service and return 500/502/503, so a 5xx is treated as "不明显" and routed to
+# deep triage (active source-packet pull + model) instead of being筛掉.
 SAFE_FAILURE_HTTP_CODES = {
     "301",
     "302",
@@ -54,11 +58,6 @@ SAFE_FAILURE_HTTP_CODES = {
     "406",
     "410",
     "429",
-    "500",
-    "501",
-    "502",
-    "503",
-    "504",
 }
 _LOCAL_EVENT_CACHE = {}
 
@@ -92,6 +91,31 @@ def compact_assets(items, limit=6):
     if items and len(items) > limit:
         output.append(f"...+{len(items) - limit}")
     return "|".join(output)
+
+
+def evidence_hit_text(evidence):
+    """源包命中摘要:有几条 + 是否带响应/命令成功线索,方便人工一眼看出。"""
+    if not isinstance(evidence, dict) or not evidence:
+        return "无源包"
+    flow = str(evidence.get("flow") or "")
+    marks = []
+    if evidence.get("cmd"):
+        marks.append("命令回显")
+    if evidence.get("resp_mark"):
+        marks.append(f"resp_mark={evidence['resp_mark']}")
+    elif evidence.get("resp") or evidence.get("resp_hint"):
+        marks.append("有响应")
+    detail = ";".join(marks) if marks else "仅请求侧"
+    return f"{flow}|{detail}" if flow else detail
+
+
+def evidence_source_text(evidence):
+    """证据来源:主动拉取 / 本地缓存 / 无。"""
+    if not isinstance(evidence, dict) or not evidence:
+        return "无"
+    if evidence.get("_fetched"):
+        return "主动拉取"
+    return "本地缓存"
 
 
 def tc3_api(config, action, payload):
@@ -227,10 +251,17 @@ def matching_local_events(record):
     return matched
 
 
-def record_source_review_evidence(record):
+def record_source_review_evidence(record, config=None):
     evidences = [event.get("source_evidence") or {} for event in matching_local_events(record)]
     evidences = [evidence for evidence in evidences if evidence]
     if not evidences:
+        # Local day cache had no match; actively pull raw packets for this
+        # event's own time window so the model gets real evidence instead of
+        # judging blind on aggregated fields.
+        if config is not None:
+            fetched = monitor.fetch_source_evidence_for_record(config, record)
+            if fetched:
+                return fetched
         return {}
 
     def evidence_score(evidence):
@@ -300,6 +331,11 @@ def safe_hourly_decision(record, labels):
         "white_hits": hits,
     }
 
+    # 三层漏斗:
+    #   第0层 确定性 — 云端成功 / 高危 / 白名单,直接定;
+    #   第1层 明显失败 — 只有“明显”才规则过筛(省 token);
+    #   第2层 不明显 — 一律保留,交给主流程的源包深度研判 + 模型。
+    # 注意:云端 attack_result 不可信,2/3 不再单独构成忽略理由,只作为辅助信号。
     if attack_result == "1":
         decision["reason"] = "云端标记攻击成功"
         return decision
@@ -310,23 +346,49 @@ def safe_hourly_decision(record, labels):
         decision["ignore"] = True
         decision["reason"] = "白名单扫描源"
         return decision
-    if attack_result in ("2", "3"):
-        decision["ignore"] = True
-        decision["reason"] = "云端明确标记攻击失败或尝试探测"
-        return decision
-    if any(keyword.lower() in name.lower() for keyword in SAFE_SCAN_KEYWORDS):
-        decision["ignore"] = True
-        decision["reason"] = "明确扫描探测类型"
-        return decision
 
     evidence = record_source_failure_evidence(record)
     decision["source_evidence"] = evidence
+
+    cloud_says_failed = attack_result in ("2", "3")
+    scanner_feature = any(keyword.lower() in name.lower() for keyword in SAFE_SCAN_KEYWORDS)
+
+    # 明显失败一:源包完整关联且响应全是失败码(4xx,已剔除 5xx)。
     if evidence["safe"]:
         decision["ignore"] = True
         decision["reason"] = f"源包完整关联且响应为失败码: {'/'.join(evidence['codes'])}"
+        return decision
+
+    # 明显失败二:纯扫描器特征事件,且云端也判失败/探测、未见任何成功失败码线索。
+    # 仅命中扫描器特征但云端未判失败时不再直接忽略,避免“伪装成扫描的真实利用”被筛掉。
+    if scanner_feature and cloud_says_failed and not evidence.get("codes"):
+        decision["ignore"] = True
+        decision["reason"] = "扫描器特征且云端判失败/探测"
+        return decision
+
+    # 不明显:保留,交由主流程主动抓源包 + 模型深度研判。
+    if cloud_says_failed:
+        decision["reason"] = "云端判失败但证据不充分,保留深度研判"
     else:
-        decision["reason"] = "攻击结果未知且无完整失败证据"
+        decision["reason"] = "攻击结果未知且无完整失败证据,保留深度研判"
     return decision
+
+
+def deep_triage_records(config, records, labels):
+    """对“不明显”的告警跑模型深度研判(含主动抓源包)。
+
+    返回 {event_id: judgement}。只处理传入的子集,High 和云端成功不在其中,
+    由调用方保留。模型判为可忽略结果的,交由调用方决定是否忽略。
+    """
+    model = (config.get("llm") or {}).get("model", "gpt-5.5")
+    rows = [record_to_judge_row(record, labels, config) for record in records]
+    judgements = monitor.llm_judge_rows(config, rows)
+    by_event = {}
+    for row in rows:
+        item = judgements.get(row["告警ID"])
+        if item:
+            by_event[row["告警ID"]] = item
+    return by_event
 
 
 def safe_hourly_dispose(config, start, end, dry_run=False):
@@ -334,7 +396,33 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
     labels = whitelist_labels(config)
     decisions = [safe_hourly_decision(record, labels) for record in records]
     ignore_ids = [item["event_id"] for item in decisions if item["ignore"] and item["event_id"]]
-    white_records = [record_to_judge_row(record, labels) for record in records if white_hits(record, labels)]
+
+    # 第2层:对规则未筛掉、且非高危/非云端成功的“不明显”告警跑深度研判。
+    alert_cfg = (config.get("llm") or {}).get("alert_center_auto_dispose") or {}
+    deep_enabled = bool(alert_cfg.get("deep_triage", True)) and not dry_run
+    deep_judgements = {}
+    deep_ignore_ids = []
+    if deep_enabled:
+        decided_ids = {item["event_id"] for item in decisions if item["ignore"]}
+        deep_records = []
+        for record, item in zip(records, decisions):
+            if item["ignore"] or item.get("white_hits"):
+                continue
+            if item.get("attack_result") == "1" or item.get("level") == "High":
+                continue  # 高危/云端成功一律保留,不自动处置
+            deep_records.append(record)
+        max_deep = int(alert_cfg.get("deep_triage_max", 120))
+        deep_records = deep_records[:max_deep]
+        if deep_records:
+            deep_judgements = deep_triage_records(config, deep_records, labels)
+            deep_ignore_ids = [
+                event_id
+                for event_id, item in deep_judgements.items()
+                if item.get("模型研判") in IGNORE_RESULTS and event_id and event_id not in decided_ids
+            ]
+            ignore_ids = ignore_ids + deep_ignore_ids
+
+    white_records = [record_to_judge_row(record, labels, config) for record in records if white_hits(record, labels)]
     omit_actions = []
     white_actions = []
     if not dry_run:
@@ -371,6 +459,9 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
         "retained_reasons": dict(Counter(item["reason"] for item in retained)),
         "retained_events": dict(Counter(item["event_name"] for item in retained)),
         "retained_items": retained[:20],
+        "deep_triaged": len(deep_judgements),
+        "deep_ignored": len(set(deep_ignore_ids)),
+        "deep_results": dict(Counter(item.get("模型研判", "") for item in deep_judgements.values())),
         "omit_actions": omit_actions,
         "white_actions": white_actions,
     }
@@ -395,7 +486,7 @@ def white_hits(record, labels):
     return sorted({str(ip) for ip in (record.get("SrcIpList") or []) if labels.get(str(ip))})
 
 
-def record_to_judge_row(record, labels):
+def record_to_judge_row(record, labels, config=None):
     hits = white_hits(record, labels)
     src_ips = [str(ip) for ip in (record.get("SrcIpList") or [])]
     dst_ips = [str(ip) for ip in (record.get("DstIpList") or [])]
@@ -408,6 +499,7 @@ def record_to_judge_row(record, labels):
         f"block={record.get('BlockStatus','')}; ignore={record.get('IgnoreStatus','')}; "
         f"white={compact_join(hits, 6)}"
     )
+    evidence = record_source_review_evidence(record, None if hits else config)
     return {
         "日期": record.get("EndTime", "")[:10],
         "告警ID": str(record.get("EventId") or record.get("AlertClusterId") or ""),
@@ -426,7 +518,9 @@ def record_to_judge_row(record, labels):
         "策略": str(record.get("Strategy", "")),
         "威胁描述": desc,
         "云防火墙建议": "告警中心聚合事件，无单条源包；需结合攻击结果和事件类型复核",
-        "源包证据": record_source_review_evidence(record),
+        "源包证据": evidence,
+        "源包命中": evidence_hit_text(evidence),
+        "证据来源": evidence_source_text(evidence),
         "本地建议": "白名单扫描源加白并忽略" if hits else "按模型研判处理",
         "白名单状态": compact_join(hits, 6) if hits else "非白名单",
         "_record": record,
@@ -455,7 +549,10 @@ def apply_judgements(rows, judgements):
     for row in rows:
         item = judgements.get(row["告警ID"]) or {}
         merged = {k: v for k, v in row.items() if not k.startswith("_")}
-        for key in ("模型研判", "模型置信度", "研判理由", "下一步", "研判来源", "研判模型", "输入Token", "输出Token", "推理Token"):
+        # 源包证据是 dict,序列化成紧凑文本方便落 CSV
+        if isinstance(merged.get("源包证据"), dict):
+            merged["源包证据"] = json.dumps(merged["源包证据"], ensure_ascii=False, separators=(",", ":"))
+        for key in ("模型研判", "模型置信度", "研判理由", "关键证据", "下一步", "研判来源", "研判模型", "输入Token", "输出Token", "推理Token"):
             merged[key] = item.get(key, "")
         out.append(merged)
     return out
@@ -586,7 +683,7 @@ def main():
     if args.limit:
         records = records[: args.limit]
 
-    rows = [record_to_judge_row(record, labels) for record in records]
+    rows = [record_to_judge_row(record, labels, config) for record in records]
     white_rows = [row for row in rows if row["_white_hits"]]
     llm_rows = [row for row in rows if not row["_white_hits"]]
     judgements = {row["告警ID"]: deterministic_white_judgement(row, model) for row in white_rows}
@@ -623,11 +720,14 @@ def main():
         "规则ID",
         "策略",
         "威胁描述",
+        "源包命中",
+        "证据来源",
         "本地建议",
         "白名单状态",
         "模型研判",
         "模型置信度",
         "研判理由",
+        "关键证据",
         "下一步",
         "研判来源",
         "研判模型",

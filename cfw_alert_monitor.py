@@ -847,6 +847,246 @@ def hydrate_events_with_source_evidence(config, day, events):
     return hydrated
 
 
+# --- Active source-packet retrieval for alert-center triage ---------------
+# Alert-center events are aggregated and carry no raw packet. Instead of only
+# hoping a matching event happens to sit in the local day cache, we actively
+# pull the threat-log index (rule_threatinfo, which carries the raw Payload)
+# for the event's own time window, parse it with source_evidence_from_record,
+# and return real request/response/command evidence to the model.
+
+_THREAT_WINDOW_CACHE = {}
+
+
+def _threat_logs_for_window(config, start_text, end_text):
+    """Fetch (and cache) parsed threat logs for a time window string."""
+    cache_key = f"{start_text}|{end_text}"
+    if cache_key in _THREAT_WINDOW_CACHE:
+        return _THREAT_WINDOW_CACHE[cache_key]
+    client = build_client(config)
+    try:
+        records, _ = fetch_threat_logs(client, start_text, end_text)
+    except Exception as exc:
+        append_llm_error("source_fetch", "threat_logs", [], exc)
+        records = []
+    index = []
+    for record in records:
+        evidence = source_evidence_from_record(record)
+        if not evidence:
+            continue
+        src = {str(record.get("SourceIp") or "")}
+        for ip in choose_attack_ips(record):
+            src.add(str(ip))
+        index.append(
+            {
+                "src_ips": {ip for ip in src if ip},
+                "dst_ip": str(record.get("TargetIp") or record.get("PublicIp") or ""),
+                "event_name": str(record.get("EventName") or ""),
+                "time": event_time(record),
+                "evidence": evidence,
+            }
+        )
+    _THREAT_WINDOW_CACHE[cache_key] = index
+    return index
+
+
+def _decode_hex_blob(value, max_bytes=4096):
+    """Decode a hex-encoded blob (netflow_nta http_* fields) to text."""
+    hex_text = re.sub(r"[^0-9A-Fa-f]", "", str(value or ""))
+    if len(hex_text) % 2:
+        hex_text = hex_text[:-1]
+    if not hex_text:
+        return ""
+    try:
+        return bytes.fromhex(hex_text[: max_bytes * 2]).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _netflow_evidence_from_record(record):
+    """Build a source_evidence dict from a netflow_nta (NTA) flow record.
+
+    netflow_nta carries full intra-VPC HTTP traffic that the threat index does
+    not — request/response headers and the response body, hex-encoded. This is
+    the only place internal (10.x/172.x → 10.x) lateral attacks leave a packet.
+    """
+    if str(record.get("event_type") or "").upper() not in ("HTTP", ""):
+        # Only HTTP flows carry parseable request/response evidence.
+        pass
+    req_head = _decode_hex_blob(record.get("http_request_header"))
+    req_body = _decode_hex_blob(record.get("http_request_body"), 1024)
+    resp_head = _decode_hex_blob(record.get("http_response_header"))
+    resp_body = _decode_hex_blob(record.get("http_response_body"))
+    if not (req_head or resp_head or resp_body):
+        return {}
+
+    req_line = first_match(r"\b((?:GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+[^\r\n]{1,300})", req_head)
+    if not req_line:
+        req_line = str(record.get("http_url") or "")
+    host = first_match(r"\bHost:\s*([^\r\n]+)", req_head)
+    ua = first_match(r"\bUser-Agent:\s*([^\r\n]+)", req_head)
+    resp_status = first_match(r"(HTTP/1\.[01]\s+\d{3}[^\r\n]*)", resp_head)
+
+    req_text = req_head + "\n" + req_body
+    resp_text = resp_head + "\n" + resp_body
+    evidence = {
+        "req": compact_text(req_line, 300),
+        "host": compact_text(host, 80),
+        "ua": compact_text(ua, 100),
+        "resp": compact_text(resp_status, 120),
+        "req_mark": evidence_marker(req_text),
+        # 成功证据主要在响应体里(命令回显/etc passwd/敏感数据),给响应打标记
+        "resp_mark": evidence_marker(resp_text),
+        "resp_body": compact_text(resp_body, 600),
+        "flow": "netflow_nta",
+    }
+    for key in list(evidence):
+        if evidence[key] in ("", "0.0.0.0", "None"):
+            evidence.pop(key, None)
+    return evidence
+
+
+def _netflow_logs_for_record(config, record, start_text, end_text, limit=60):
+    """Fetch netflow_nta flows for this record's src IPs within the window.
+
+    Filtered by src_ip to keep the query bounded (the raw index has tens of
+    millions of rows). Cached per (src_ip|window)."""
+    src_ips = [str(ip) for ip in (record.get("SrcIpList") or []) if str(ip)]
+    if not src_ips:
+        return []
+    client = build_client(config)
+    out = []
+    for src_ip in src_ips[:4]:
+        cache_key = f"netflow|{src_ip}|{start_text}|{end_text}"
+        if cache_key in _THREAT_WINDOW_CACHE:
+            out.extend(_THREAT_WINDOW_CACHE[cache_key])
+            continue
+        rows = []
+        try:
+            req = models.DescribeLogsRequest()
+            req.Index = "netflow_nta"
+            req.Limit = limit
+            req.Offset = 0
+            req.StartTime = start_text
+            req.EndTime = end_text
+            # 只取 HTTP 流量(有可解析的请求/响应),跳过 TCP 元数据噪声,
+            # 否则繁忙 IP 的前几页全是 TCP,HTTP 证据被埋掉。
+            flt_ip = models.CommonFilter()
+            flt_ip.Name = "src_ip"
+            flt_ip.OperatorType = 1
+            flt_ip.Values = [src_ip]
+            flt_http = models.CommonFilter()
+            flt_http.Name = "event_type"
+            flt_http.OperatorType = 1
+            flt_http.Values = ["HTTP"]
+            req.Filters = [flt_ip, flt_http]
+            resp = client.DescribeLogs(req)
+            for rec in parse_data(resp.Data):
+                evidence = _netflow_evidence_from_record(rec)
+                if not evidence:
+                    continue
+                rows.append(
+                    {
+                        "src_ips": {str(rec.get("src_ip") or src_ip)},
+                        "dst_ip": str(rec.get("dst_ip") or ""),
+                        "event_name": "",
+                        "time": str(rec.get("EndTime") or ""),
+                        "evidence": evidence,
+                    }
+                )
+        except Exception as exc:
+            append_llm_error("source_fetch", "netflow_nta", [], exc)
+        _THREAT_WINDOW_CACHE[cache_key] = rows
+        out.extend(rows)
+    return out
+
+
+def _evidence_quality(evidence):
+    score = 0
+    if evidence.get("cmd"):
+        score += 8
+    if evidence.get("resp_mark"):
+        score += 6
+    if evidence.get("resp") or evidence.get("resp_hint"):
+        score += 4
+    if evidence.get("req_mark"):
+        score += 2
+    if evidence.get("req"):
+        score += 1
+    return score
+
+
+def fetch_source_evidence_for_record(config, record, pad_minutes=10, limit=6):
+    """Actively pull raw source packets matching an alert-center record.
+
+    Lenient match: source IP overlap (preferred) and event name, within the
+    record's time window padded by pad_minutes. Returns the combined evidence
+    of the strongest matches, or {} when nothing relevant is found.
+    """
+    def _parse(value):
+        try:
+            return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            return None
+
+    start = _parse(record.get("StartTime"))
+    end = _parse(record.get("EndTime"))
+    if not start or not end:
+        return {}
+    src_ips = {str(ip) for ip in (record.get("SrcIpList") or [])}
+    dst_ips = {str(ip) for ip in (record.get("DstIpList") or [])}
+    event_name = str(record.get("EventName") or "")
+
+    window_start = dt_text(start - timedelta(minutes=pad_minutes))
+    window_end = dt_text(end + timedelta(minutes=pad_minutes))
+
+    def _match(candidates, require_event=True, enforce_dst=True):
+        out = []
+        for item in candidates:
+            if src_ips and not (item["src_ips"] & src_ips):
+                continue
+            if not src_ips and require_event and event_name and item["event_name"] != event_name:
+                continue
+            if enforce_dst and dst_ips and item["dst_ip"] and item["dst_ip"] not in dst_ips:
+                continue
+            if require_event and event_name and item["event_name"] and item["event_name"] != event_name:
+                out.append((0, item["evidence"]))
+                continue
+            # dst 匹配上的额外加权,匹配不上的也保留(XFF/代理会改写 dst)。
+            dst_bonus = 50 if (dst_ips and item["dst_ip"] in dst_ips) else 0
+            out.append((_evidence_quality(item["evidence"]) + 100 + dst_bonus, item["evidence"]))
+        return out
+
+    # 第一来源:威胁日志(rule_threatinfo),覆盖公网攻击。
+    matched = _match(_threat_logs_for_window(config, window_start, window_end))
+    source_tag = "threat_logs"
+
+    # 回退来源:NTA 全流量(netflow_nta),覆盖内网横向(10.x/172.x)攻击 ——
+    # 威胁日志查不到内网包,但 NTA 记录了完整内网 HTTP 请求/响应体。
+    if not matched:
+        netflow = _netflow_logs_for_record(config, record, window_start, window_end)
+        # 内网流量按 src_ip 匹配为主,dst 仅加权不强制(XFF/代理改写 dst)。
+        matched = _match(netflow, require_event=False, enforce_dst=False)
+        source_tag = "netflow_nta"
+
+    if not matched:
+        return {}
+    matched.sort(key=lambda pair: pair[0], reverse=True)
+    selected = [ev for _, ev in matched[:limit]]
+
+    combined = {}
+    for key in ("ar", "req", "host", "ua", "resp", "resp_hint", "req_mark", "resp_mark", "resp_body", "cmd"):
+        values = []
+        for evidence in selected:
+            value = str(evidence.get(key) or "").strip()
+            if value and value not in values:
+                values.append(value)
+        if values:
+            combined[key] = " || ".join(values)
+    combined["flow"] = f"fetched_{source_tag}={len(matched)}"
+    combined["_fetched"] = True
+    return combined
+
+
 def action_for(levels, event_names):
     level_set = set(levels)
     names = " ".join(event_names)
@@ -1159,6 +1399,17 @@ def compact_direct_row(row, index):
             compact["desc"] = str(row.get("威胁描述"))[:160]
         if row.get("云防火墙建议"):
             compact["suggest"] = str(row.get("云防火墙建议"))[:120]
+        # 把已抓到的源包证据(含主动拉取的 HTTP 请求/响应)带进首轮研判,
+        # 否则模型看不到包,只能按聚合字段判“无源包”。
+        evidence = row.get("源包证据")
+        if isinstance(evidence, dict) and evidence:
+            trimmed = {}
+            for key in ("ar", "req", "resp", "req_mark", "resp_mark", "resp_body", "cmd"):
+                value = str(evidence.get(key) or "").strip()
+                if value:
+                    trimmed[key] = compact_text(value, 300 if key in ("resp_body", "req") else 140)
+            if trimmed:
+                compact["e"] = trimmed
         return compact
 
     return {
@@ -1287,9 +1538,15 @@ def codex_direct_prompt(batch, id_map):
         task = (
             "逐条复核云防火墙告警是否攻击成功。结果只能取:"
             "确认成功,确认未成功,未见成功证据,扫描探测,需人工复核。"
-            "确认成功必须有明确证据: attack_result成功、命令执行、文件写入、webshell、敏感数据返回、回连。"
-            "有明确失败/阻断证据才判确认未成功。只有探测特征且无成功证据判扫描探测。"
-            "证据不足但风险高判需人工复核；普通缺少成功证据判未见成功证据。"
+            "字段e是已抓取的真实源数据包(ar=攻击结果,req=请求行,resp=响应状态,"
+            "resp_mark/req_mark=特征标记,resp_body=响应体,cmd=命令回显);有e时必须"
+            "基于真实包给出有依据的初步结论,不要再判“无源包”。"
+            "确认成功必须有明确证据: ar成功、命令执行回显、文件写入、webshell、"
+            "敏感数据返回(如响应体含/etc/passwd内容、uid=、phpinfo)、回连。"
+            "请求里带../etc/passwd等利用串且resp为200并在resp_body看到敏感内容→确认成功;"
+            "resp为404/403/401或WAF阻断→确认未成功;有利用请求但响应非成功且无回显→未见成功证据;"
+            "纯扫描器特征→扫描探测;有真实包但证据矛盾或确实高危且无法定论→需人工复核。"
+            "单独HTTP 200、普通页面、ETag、哈希样字符串不算成功证据。"
         )
     else:
         task = (
@@ -1298,8 +1555,9 @@ def codex_direct_prompt(batch, id_map):
         )
     return (
         task
-        + "只输出JSON数组，每项字段:id,result,confidence,evidence,next。"
-        "confidence取high/medium/low。evidence和next均不超过18个汉字。"
+        + "只输出JSON数组，每项字段:id,result,confidence,evidence,next,key_evidence。"
+        "confidence取high/medium/low。evidence(判定依据)不超过40个汉字,next不超过20个汉字。"
+        "key_evidence摘抄源包中最支撑结论的原文片段(≤120字符),无源包则空串。"
         "腾讯云扫描IP和公司漏扫IP已过滤，不能声称已经执行封禁。告警="
         + json.dumps(compact_rows, ensure_ascii=False, separators=(",", ":"))
     )
@@ -1432,8 +1690,9 @@ def call_codex_direct_batch(config, model, batch):
         if key:
             item["模型研判"] = normalize_direct_result(item.get("result") or item.get("模型研判"))
             item["模型置信度"] = normalize_confidence(item.get("confidence") or item.get("模型置信度"))
-            item["研判理由"] = str(item.get("evidence") or item.get("研判理由") or "")[:80]
+            item["研判理由"] = str(item.get("evidence") or item.get("研判理由") or "")[:120]
             item["下一步"] = str(item.get("next") or item.get("下一步") or "")[:80]
+            item["关键证据"] = str(item.get("key_evidence") or item.get("关键证据") or "")[:160]
             by_key[str(key)] = item
     usage["elapsed_seconds"] = round(time.perf_counter() - started, 3)
     usage["response_id"] = response_id
@@ -1475,6 +1734,7 @@ def has_source_evidence(row):
         or evidence.get("ar")
         or evidence.get("req_mark")
         or evidence.get("resp_mark")
+        or evidence.get("resp_body")
     )
 
 
@@ -1487,16 +1747,30 @@ def has_success_source_evidence(row):
         return True
     resp_mark = set(str(evidence.get("resp_mark") or "").split(","))
     success_marks = {"git_ref", "passwd", "phpinfo", "cmd_uid", "index_of", "webshell"}
-    return bool(resp_mark & success_marks)
+    if resp_mark & success_marks:
+        return True
+    # 内网 NTA 抓到的响应体里若出现命令回显/敏感文件标记,也算成功证据
+    body_marks = set(evidence_marker(str(evidence.get("resp_body") or "")).split(","))
+    return bool(body_marks & success_marks)
 
 
 def compact_source_review_row(row, index, max_chars):
     evidence = dict(source_evidence(row))
     trimmed = {}
-    for key in ("ar", "req", "host", "ua", "resp", "req_mark", "resp_mark", "cmd", "flow", "log", "decrypt"):
+    # 成功证据主要藏在响应体和命令回显里,给这些字段更宽的预算,避免回显被截断
+    # 导致“看不出成功”。请求侧只是攻击特征,保持较短。
+    wide_keys = {"resp", "resp_hint", "resp_mark", "resp_body", "cmd", "decrypt"}
+    for key in ("ar", "req", "host", "ua", "resp", "resp_hint", "req_mark", "resp_mark", "resp_body", "cmd", "flow", "log", "decrypt"):
         value = evidence.get(key)
-        if value:
-            trimmed[key] = compact_text(value, max_chars if key == "req" else 120)
+        if not value:
+            continue
+        if key == "req":
+            limit = max_chars
+        elif key in wide_keys:
+            limit = max(max_chars, 600)
+        else:
+            limit = 120
+        trimmed[key] = compact_text(value, limit)
     return {
         "id": index,
         "prev": row.get("模型研判", ""),
@@ -1527,8 +1801,11 @@ def source_review_prompt(batch, id_map, max_chars):
         "响应为404/403/401、WAF阻断、无有效回显且只有利用尝试时确认未成功或未见成功证据；"
         "目录扫描、敏感文件探测、zgrab/masscan/censys特征判扫描探测；"
         "只有缺关键源包证据且确实高危才保留需人工复核。"
-        "只输出JSON数组，每项字段:id,result,confidence,evidence,next。"
-        "confidence取high/medium/low，evidence和next不超过16个汉字。样本="
+        "对高危(lv=高危)告警必须逐条审视响应体/命令回显,给出可复核的证据链,不要只给标签。"
+        "只输出JSON数组，每项字段:id,result,confidence,evidence,next,key_evidence。"
+        "evidence用不超过40个汉字说明判定依据;next不超过20个汉字;"
+        "key_evidence直接摘抄源包中最能支撑结论的原文片段(命令回显/响应状态/敏感数据,≤120字符),无则空串。"
+        "confidence取high/medium/low。样本="
         + json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
     )
 
@@ -1539,8 +1816,13 @@ def call_codex_direct_source_batch(config, model, batch):
     max_chars = int(source_cfg.get("max_evidence_chars", 420))
     id_map = {}
     prompt = source_review_prompt(batch, id_map, max_chars)
+    # 高危深度研判通道:批次含高危告警时,把推理强度升到 high,让模型真正
+    # 沿证据链推断而不是浅层归类。普通批次维持配置的较低强度以控成本。
+    base_effort = source_cfg.get("reasoning_effort", llm.get("reasoning_effort", "medium"))
+    has_high = any(row.get("告警等级") == "高危" for row in batch)
+    effort = source_cfg.get("high_reasoning_effort", "high") if has_high else base_effort
     body = json.dumps(
-        codex_direct_request_body(model, prompt, source_cfg.get("reasoning_effort", llm.get("reasoning_effort", "medium"))),
+        codex_direct_request_body(model, prompt, effort),
         ensure_ascii=False,
     ).encode("utf-8")
     req = urllib.request.Request(
@@ -1593,8 +1875,9 @@ def call_codex_direct_source_batch(config, model, batch):
             by_group[key] = {
                 "模型研判": normalize_direct_result(item.get("result") or item.get("模型研判")),
                 "模型置信度": normalize_confidence(item.get("confidence") or item.get("模型置信度")),
-                "研判理由": str(item.get("evidence") or item.get("研判理由") or "")[:80],
+                "研判理由": str(item.get("evidence") or item.get("研判理由") or "")[:120],
                 "下一步": str(item.get("next") or item.get("下一步") or "")[:80],
+                "关键证据": str(item.get("key_evidence") or item.get("关键证据") or "")[:160],
             }
     usage["elapsed_seconds"] = round(time.perf_counter() - started, 3)
     return by_group, usage
@@ -1608,13 +1891,21 @@ def refine_judgements_with_source(config, rows, judgements, model):
     max_groups = int(source_cfg.get("max_groups_per_run", 200))
     batch_size = max(1, int(source_cfg.get("batch_size", 60)))
 
+    # 只要抓到了真实源包就做源包深度研判,不再因为首轮贴了浅标签而跳过 ——
+    # 这是“拉到 HTTP 源包必须基于包给结论”的关键。可用 review_all_with_evidence
+    # 关掉,退回只复核“需人工复核”。
+    review_all = bool(source_cfg.get("review_all_with_evidence", True))
     groups = {}
     for row in rows:
         key = judgement_key(row)
         judgement = judgements.get(key) or {}
-        if judgement.get("模型研判") != "需人工复核":
-            continue
+        result = judgement.get("模型研判")
         if not has_source_evidence(row):
+            continue
+        if not review_all and result != "需人工复核":
+            continue
+        # 首轮已高置信判定为纯扫描的,无需再花一轮(扫描器特征足够明确)。
+        if result == "扫描探测" and judgement.get("模型置信度") == "高":
             continue
         group_key = source_group_key(row)
         groups.setdefault(group_key, row)
@@ -1659,6 +1950,7 @@ def refine_judgements_with_source(config, rows, judgements, model):
                 "模型置信度": item.get("模型置信度", current.get("模型置信度", "")),
                 "研判理由": model_reason,
                 "下一步": item.get("下一步", current.get("下一步", "")),
+                "关键证据": item.get("关键证据", current.get("关键证据", "")),
                 "研判来源": "codex_direct_source",
                 "研判模型": model,
                 "输入Token": str((item.get("_usage") or {}).get("input_tokens", current.get("输入Token", ""))),
@@ -1732,6 +2024,7 @@ def llm_judge_rows(config, rows):
                         "模型研判": judgement,
                         "模型置信度": confidence,
                         "研判理由": reason,
+                        "关键证据": str(item.get("关键证据") or ""),
                         "下一步": next_step,
                         "研判来源": provider,
                         "研判模型": model,
