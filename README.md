@@ -100,6 +100,24 @@ Windows 计划任务可分别调用：
 - `run_collect.ps1`
 - `run_daily_report.ps1`
 
+## 控制台
+
+本地 Web 看板，看告警量、研判分布、token 消耗(按研判来源拆分)、源包命中率、降级/处置健康，并可下钻每条告警的证据链和工具轨迹。数据读 `data/` 与 `reports/`，无数据库，默认只绑定本机回环。
+
+```powershell
+python -m pip install flask
+python .\console.py            # 打开 http://127.0.0.1:8787
+# 或
+.\run_console.ps1 8787
+```
+
+命令行快速汇总(无需浏览器)：
+
+```powershell
+python .\triage_stats.py --days 7          # 文字报表
+python .\triage_stats.py --days 7 --json   # 完整 JSON
+```
+
 ## 安全边界
 
 - 工具不会自动封禁攻击 IP。

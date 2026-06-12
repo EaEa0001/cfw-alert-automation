@@ -1,0 +1,279 @@
+"""研判控制台聚合层。
+
+读取 data/ 和 reports/ 下的运行产物,算成结构化指标供命令行/Web 控制台展示。
+不依赖数据库,纯读 jsonl。所有时间按本地时间字符串 (YYYY-MM-DD HH:MM:SS) 处理。
+"""
+import glob
+import json
+import os
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data"
+REPORT_DIR = ROOT / "reports"
+LOG_DIR = ROOT / "logs"
+
+RESULT_ORDER = ["确认成功", "需人工复核", "未见成功证据", "确认未成功", "扫描探测"]
+SOURCE_LABEL = {
+    "codex_direct": "单轮",
+    "codex_direct_source": "源包复核",
+    "codex_agent": "Agent",
+    "rule_whitelist": "白名单规则",
+}
+
+
+def source_label(value):
+    value = str(value or "")
+    if value in SOURCE_LABEL:
+        return SOURCE_LABEL[value]
+    if value.startswith("rule_fallback"):
+        return "降级兜底"
+    return value or "未知"
+
+
+def _read_jsonl(path):
+    rows = []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    except OSError:
+        pass
+    return rows
+
+
+def _parse_time(value):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(str(value)[:19], fmt)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _to_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def load_judgements(days):
+    """汇总近 N 天的逐条研判(去重:同一告警ID保留最新文件里的)。"""
+    cutoff = datetime.now() - timedelta(days=days)
+    rows = []
+    for path in sorted(glob.glob(str(REPORT_DIR / "cfw_alert_center_judgement_*.jsonl"))):
+        # 文件名带时间戳 cfw_alert_center_judgement_YYYYMMDD_HHMMSS
+        stamp = os.path.basename(path).replace("cfw_alert_center_judgement_", "").replace(".jsonl", "")
+        ts = _parse_time(stamp.replace("_", " ").replace("  ", " ")[:8] + " 00:00:00") if "_" in stamp else None
+        try:
+            file_dt = datetime.strptime(stamp, "%Y%m%d_%H%M%S")
+        except ValueError:
+            file_dt = ts
+        if file_dt and file_dt < cutoff - timedelta(days=1):
+            continue
+        for row in _read_jsonl(path):
+            at = _parse_time(row.get("告警时间")) or file_dt
+            if at and at >= cutoff:
+                row["_at"] = at
+                row["_file_dt"] = file_dt
+                rows.append(row)
+    # 去重:同一告警ID保留来自最新文件的那条
+    by_id = {}
+    for row in rows:
+        aid = row.get("告警ID") or id(row)
+        prev = by_id.get(aid)
+        if not prev or (row.get("_file_dt") and prev.get("_file_dt") and row["_file_dt"] >= prev["_file_dt"]):
+            by_id[aid] = row
+    return list(by_id.values())
+
+
+def overview(days=7):
+    rows = load_judgements(days)
+    total = len(rows)
+    results = Counter(r.get("模型研判", "") for r in rows)
+    sources = Counter(source_label(r.get("研判来源", "")) for r in rows)
+    levels = Counter(r.get("告警等级", "") for r in rows)
+    evidence_src = Counter(r.get("证据来源", "") or "无" for r in rows)
+
+    ignore_set = {"确认未成功", "未见成功证据", "扫描探测"}
+    auto_ignored = sum(results.get(k, 0) for k in ignore_set)
+    retained = total - auto_ignored
+
+    tok_in = sum(_to_int(r.get("输入Token")) for r in rows)
+    tok_out = sum(_to_int(r.get("输出Token")) for r in rows)
+    tok_reason = sum(_to_int(r.get("推理Token")) for r in rows)
+
+    # token 按研判来源拆分(看 Agent 到底吃了多少)
+    tok_by_source = defaultdict(lambda: {"in": 0, "out": 0, "reason": 0, "count": 0})
+    for r in rows:
+        s = source_label(r.get("研判来源", ""))
+        tok_by_source[s]["in"] += _to_int(r.get("输入Token"))
+        tok_by_source[s]["out"] += _to_int(r.get("输出Token"))
+        tok_by_source[s]["reason"] += _to_int(r.get("推理Token"))
+        tok_by_source[s]["count"] += 1
+
+    return {
+        "days": days,
+        "total": total,
+        "auto_ignored": auto_ignored,
+        "retained": retained,
+        "ignore_rate": round(auto_ignored / total * 100, 1) if total else 0,
+        "results": {k: results.get(k, 0) for k in RESULT_ORDER if results.get(k)},
+        "sources": dict(sources),
+        "levels": dict(levels),
+        "evidence_source": dict(evidence_src),
+        "tokens": {"input": tok_in, "output": tok_out, "reasoning": tok_reason,
+                   "total": tok_in + tok_out + tok_reason},
+        "tokens_by_source": {k: dict(v) for k, v in tok_by_source.items()},
+    }
+
+
+def trend(days=7):
+    """按天聚合:告警量、研判结果堆叠、token 量。"""
+    rows = load_judgements(days)
+    by_day = defaultdict(lambda: {"total": 0, "tokens": 0,
+                                  **{k: 0 for k in RESULT_ORDER}})
+    for r in rows:
+        at = r.get("_at")
+        if not at:
+            continue
+        day = at.strftime("%Y-%m-%d")
+        by_day[day]["total"] += 1
+        res = r.get("模型研判", "")
+        if res in by_day[day]:
+            by_day[day][res] += 1
+        by_day[day]["tokens"] += (_to_int(r.get("输入Token")) + _to_int(r.get("输出Token"))
+                                  + _to_int(r.get("推理Token")))
+    days_sorted = sorted(by_day.keys())
+    return {
+        "days": days_sorted,
+        "total": [by_day[d]["total"] for d in days_sorted],
+        "tokens": [by_day[d]["tokens"] for d in days_sorted],
+        "results": {k: [by_day[d][k] for d in days_sorted] for k in RESULT_ORDER},
+    }
+
+
+def alerts(days=7, level=None, result=None, source=None, limit=300):
+    rows = load_judgements(days)
+    out = []
+    for r in rows:
+        if level and r.get("告警等级") != level:
+            continue
+        if result and r.get("模型研判") != result:
+            continue
+        if source and source_label(r.get("研判来源", "")) != source:
+            continue
+        out.append({
+            "告警ID": r.get("告警ID", ""),
+            "告警时间": r.get("告警时间", ""),
+            "攻击IP": r.get("攻击IP", ""),
+            "目标IP": r.get("目标IP", ""),
+            "告警等级": r.get("告警等级", ""),
+            "事件名称": r.get("事件名称", ""),
+            "模型研判": r.get("模型研判", ""),
+            "模型置信度": r.get("模型置信度", ""),
+            "研判理由": r.get("研判理由", ""),
+            "关键证据": r.get("关键证据", ""),
+            "证据来源": r.get("证据来源", ""),
+            "研判来源": source_label(r.get("研判来源", "")),
+            "工具轨迹": r.get("工具轨迹", ""),
+            "源包证据": r.get("源包证据", ""),
+            "Token": _to_int(r.get("输入Token")) + _to_int(r.get("输出Token")) + _to_int(r.get("推理Token")),
+        })
+    out.sort(key=lambda x: x["告警时间"], reverse=True)
+    return out[:limit]
+
+
+def health(days=7):
+    """健康面板:LLM 错误/降级、处置失败、源包命中率、Agent 占比、企微发送。"""
+    cutoff = datetime.now() - timedelta(days=days)
+    # LLM 错误(降级原因)
+    errors = []
+    err_by_type = Counter()
+    for e in _read_jsonl(LOG_DIR / "llm-errors.jsonl"):
+        at = _parse_time(e.get("time"))
+        if at and at >= cutoff:
+            err_by_type[e.get("error_type", "?")] += 1
+            errors.append({"time": e.get("time"), "provider": e.get("provider"),
+                           "type": e.get("error_type"), "error": str(e.get("error", ""))[:160]})
+    # 处置情况(从 hourly 记录)
+    dispose_ignored = dispose_failed = 0
+    for path in sorted(glob.glob(str(DATA_DIR / "alert-center-hourly-*.jsonl"))):
+        for rec in _read_jsonl(path):
+            at = _parse_time(rec.get("recorded_at"))
+            if not (at and at >= cutoff):
+                continue
+            dispose_ignored += _to_int(rec.get("ignored_confirmed"))
+            for action in (rec.get("omit_actions") or []) + (rec.get("white_actions") or []):
+                if action.get("error") or action.get("return_code") not in (None, 0, "0"):
+                    dispose_failed += 1
+    # 源包命中率 / Agent 占比
+    rows = load_judgements(days)
+    with_evidence = sum(1 for r in rows if r.get("证据来源") in ("主动拉取", "本地缓存"))
+    agent_count = sum(1 for r in rows if r.get("研判来源") == "codex_agent")
+    return {
+        "errors_total": sum(err_by_type.values()),
+        "errors_by_type": dict(err_by_type),
+        "recent_errors": errors[-15:][::-1],
+        "dispose_ignored": dispose_ignored,
+        "dispose_failed": dispose_failed,
+        "evidence_hit_rate": round(with_evidence / len(rows) * 100, 1) if rows else 0,
+        "evidence_hit": with_evidence,
+        "agent_count": agent_count,
+        "total": len(rows),
+    }
+
+
+def full_report(days=7):
+    return {
+        "overview": overview(days),
+        "trend": trend(days),
+        "health": health(days),
+    }
+
+
+def _print_console(days):
+    ov = overview(days)
+    he = health(days)
+    line = "=" * 52
+    print(line)
+    print(f"  CFW 研判控制台   近 {days} 天")
+    print(line)
+    print(f"告警总量 {ov['total']}  |  自动忽略 {ov['auto_ignored']} ({ov['ignore_rate']}%)  |  保留 {ov['retained']}")
+    print("研判分布:", "  ".join(f"{k} {v}" for k, v in ov["results"].items()))
+    print("研判来源:", "  ".join(f"{k} {v}" for k, v in ov["sources"].items()))
+    print("证据来源:", "  ".join(f"{k} {v}" for k, v in ov["evidence_source"].items()))
+    t = ov["tokens"]
+    print(f"Token: 输入 {t['input']:,}  输出 {t['output']:,}  推理 {t['reasoning']:,}  合计 {t['total']:,}")
+    print("Token按来源:")
+    for s, v in sorted(ov["tokens_by_source"].items(), key=lambda kv: -(kv[1]["in"] + kv[1]["out"])):
+        print(f"   {s:10s} 调用{v['count']:4d}  in {v['in']:>9,}  out {v['out']:>7,}  reason {v['reason']:>7,}")
+    print(line)
+    print(f"源包命中率 {he['evidence_hit_rate']}% ({he['evidence_hit']}/{he['total']})  |  Agent 研判 {he['agent_count']}")
+    print(f"处置忽略 {he['dispose_ignored']}  |  处置失败 {he['dispose_failed']}  |  LLM错误/降级 {he['errors_total']} {he['errors_by_type']}")
+    if he["recent_errors"]:
+        print("最近错误:")
+        for e in he["recent_errors"][:5]:
+            print(f"   {e['time']} {e['provider']} {e['type']}")
+    print(line)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="CFW 研判控制台数据聚合")
+    parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("--json", action="store_true", help="输出完整 JSON 而非文字报表")
+    args = parser.parse_args()
+    if args.json:
+        print(json.dumps(full_report(args.days), ensure_ascii=False, indent=2))
+    else:
+        _print_console(args.days)
