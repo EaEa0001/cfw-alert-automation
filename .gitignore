@@ -1,12 +1,12 @@
 # Local runtime configuration and credentials
-config.json
+/config.json
 .env
 .env.*
 
 # Runtime data
-data/
-logs/
-reports/
+/data/
+/logs/
+/reports/
 
 # Python
 __pycache__/
