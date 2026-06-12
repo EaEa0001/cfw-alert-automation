@@ -24,6 +24,10 @@
 - 最后一轮强制 `tool_choice=none`,确保模型必须给出结论而非无限取证。
 - 安全闸:Agent 判“确认成功”但该告警无落地源包证据时,降回“未见成功证据”。Agent 失败时保留原研判,不影响主流程。
 
+### 调用重试
+
+所有 Codex 调用(单轮/源包复核/Agent)在连接类错误(超时、连接被拒、流中断)上自动指数退避重试,降低 `WinError 10060/10061` 导致的降级。`HTTPError` 等业务错误不重试。重试事件记入 `logs/llm-errors.jsonl`,控制台健康面板可见。由 `llm.retry`(`max_retries`/`backoff_seconds`/`backoff_factor`)配置。
+
 ### 源包抓取说明
 
 - HTTP 是唯一能稳定拿到应用层 payload 的协议:`netflow_nta` 按 `app_protocol=HTTP` 过滤(而非 `event_type`,后者会把部分本质 HTTP 的流标成 TCP),可解码请求头/响应头/响应体。

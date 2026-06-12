@@ -28,6 +28,11 @@
     "batch_size": 80,
     "timeout_seconds": 300,
     "ignore_user_config": true,
+    "retry": {
+      "max_retries": 2,
+      "backoff_seconds": 2.0,
+      "backoff_factor": 2.0
+    },
     "source_review": {
       "enabled": true,
       "reasoning_effort": "medium",

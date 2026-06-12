@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import http.client
 import time
 import urllib.error
 import urllib.request
@@ -1647,6 +1648,48 @@ def handle_codex_direct_sse(event_name, data):
     return event_type, "", None, None
 
 
+def _retry_cfg(config):
+    llm = config.get("llm") or {}
+    retry = llm.get("retry") or {}
+    return (
+        max(0, int(retry.get("max_retries", 2))),
+        float(retry.get("backoff_seconds", 2.0)),
+        float(retry.get("backoff_factor", 2.0)),
+    )
+
+
+def with_codex_retry(config, attempt_fn, label):
+    """对一次完整的请求+流式消费做重试。
+
+    只在连接类错误(URLError/超时/不完整读取)上重试——这些是抖动,重试有意义;
+    HTTPError(4xx/5xx 业务错误)和已解析的 RuntimeError 立即抛出,重试无益。
+    指数退避。重试事件记入 llm-errors.jsonl 便于在控制台看降级前的抖动。
+    """
+    max_retries, backoff, factor = _retry_cfg(config)
+    delay = backoff
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            return attempt_fn()
+        except urllib.error.HTTPError:
+            raise  # 业务错误,重试无意义
+        except (urllib.error.URLError, TimeoutError, ConnectionError,
+                http.client.IncompleteRead, http.client.RemoteDisconnected) as exc:
+            last_exc = exc
+            if attempt >= max_retries:
+                break
+            append_jsonl(LOG_DIR / "llm-errors.jsonl", [{
+                "time": dt_text(now_local()),
+                "provider": label,
+                "model": (config.get("llm") or {}).get("model", ""),
+                "error_type": "retry_" + type(exc).__name__,
+                "error": f"attempt {attempt + 1}/{max_retries + 1} failed: {str(exc)[:300]}",
+            }])
+            time.sleep(delay)
+            delay *= factor
+    raise last_exc
+
+
 def call_codex_direct_batch(config, model, batch):
     llm = config.get("llm") or {}
     id_map = {}
@@ -1662,39 +1705,44 @@ def call_codex_direct_batch(config, model, batch):
         headers=load_codex_auth_headers(),
     )
 
-    output_chunks = []
-    usage = {}
-    response_id = ""
     started = time.perf_counter()
-    try:
-        with urllib.request.urlopen(req, timeout=float(llm.get("timeout_seconds", 180))) as resp:
-            event_name = None
-            data_lines = []
-            for raw_line in resp:
-                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-                if not line:
-                    if data_lines:
-                        event_type, text, event_usage, event_response_id = handle_codex_direct_sse(
-                            event_name, "\n".join(data_lines)
-                        )
-                        if text and (event_type != "response.completed" or not output_chunks):
-                            output_chunks.append(text)
-                        if event_usage is not None:
-                            usage = parse_codex_direct_usage(event_usage)
-                        if event_response_id:
-                            response_id = event_response_id
-                        if event_type == "response.completed":
-                            break
-                    event_name = None
-                    data_lines = []
-                    continue
-                if line.startswith("event:"):
-                    event_name = line.split(":", 1)[1].strip()
-                elif line.startswith("data:"):
-                    data_lines.append(line.split(":", 1)[1].lstrip())
-    except urllib.error.HTTPError as exc:
-        body_text = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"codex direct HTTP {exc.code}: {body_text[:800]}") from exc
+
+    def _attempt():
+        output_chunks = []
+        usage = {}
+        response_id = ""
+        try:
+            with urllib.request.urlopen(req, timeout=float(llm.get("timeout_seconds", 180))) as resp:
+                event_name = None
+                data_lines = []
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if not line:
+                        if data_lines:
+                            event_type, text, event_usage, event_response_id = handle_codex_direct_sse(
+                                event_name, "\n".join(data_lines)
+                            )
+                            if text and (event_type != "response.completed" or not output_chunks):
+                                output_chunks.append(text)
+                            if event_usage is not None:
+                                usage = parse_codex_direct_usage(event_usage)
+                            if event_response_id:
+                                response_id = event_response_id
+                            if event_type == "response.completed":
+                                break
+                        event_name = None
+                        data_lines = []
+                        continue
+                    if line.startswith("event:"):
+                        event_name = line.split(":", 1)[1].strip()
+                    elif line.startswith("data:"):
+                        data_lines.append(line.split(":", 1)[1].lstrip())
+        except urllib.error.HTTPError as exc:
+            body_text = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"codex direct HTTP {exc.code}: {body_text[:800]}") from exc
+        return output_chunks, usage, response_id
+
+    output_chunks, usage, response_id = with_codex_retry(config, _attempt, "codex_direct")
 
     parsed = parse_llm_json("".join(output_chunks))
     results = extract_llm_results(parsed)
@@ -1862,60 +1910,68 @@ def _agent_stream_once(config, body):
         llm.get("codex_responses_url") or CODEX_RESPONSES_URL,
         data=data, method="POST", headers=load_codex_auth_headers(),
     )
-    text_parts = []
-    calls = {}  # item_id -> {call_id,name,arguments}
-    usage = {}
-    with urllib.request.urlopen(req, timeout=float(llm.get("timeout_seconds", 180))) as resp:
-        event_name = None
-        data_lines = []
-        for raw in resp:
-            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-            if line:
-                if line.startswith("event:"):
-                    event_name = line.split(":", 1)[1].strip()
-                elif line.startswith("data:"):
-                    data_lines.append(line.split(":", 1)[1].lstrip())
-                continue
-            if not data_lines:
-                continue
-            blob = "\n".join(data_lines)
-            data_lines = []
-            event_name = None
-            if blob == "[DONE]":
-                continue
-            try:
-                payload = json.loads(blob)
-            except Exception:
-                continue
-            et = payload.get("type") or ""
-            if et == "response.output_text.delta":
-                text_parts.append(payload.get("delta", ""))
-            elif et == "response.output_item.added":
-                item = payload.get("item") or {}
-                if item.get("type") == "function_call":
-                    calls[item.get("id")] = {
-                        "call_id": item.get("call_id"),
-                        "name": item.get("name"),
-                        "arguments": item.get("arguments") or "",
-                    }
-            elif et == "response.function_call_arguments.delta":
-                cid = payload.get("item_id")
-                if cid in calls:
-                    calls[cid]["arguments"] += payload.get("delta", "")
-            elif et == "response.function_call_arguments.done":
-                cid = payload.get("item_id")
-                if cid in calls and payload.get("arguments"):
-                    calls[cid]["arguments"] = payload.get("arguments")
-            elif et == "response.completed":
-                response = payload.get("response") or {}
-                if not text_parts:
-                    text_parts.append(extract_completed_output(response))
-                usage = parse_codex_direct_usage(response.get("usage"))
-            elif et in {"response.failed", "response.incomplete"}:
-                response = payload.get("response") or {}
-                err = response.get("error") or payload.get("error") or {}
-                raise RuntimeError(f"{et}: {json.dumps(err, ensure_ascii=False)[:400]}")
-    return "".join(text_parts), list(calls.values()), usage
+
+    def _attempt():
+        text_parts = []
+        calls = {}  # item_id -> {call_id,name,arguments}
+        usage = {}
+        try:
+            with urllib.request.urlopen(req, timeout=float(llm.get("timeout_seconds", 180))) as resp:
+                event_name = None
+                data_lines = []
+                for raw in resp:
+                    line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if line:
+                        if line.startswith("event:"):
+                            event_name = line.split(":", 1)[1].strip()
+                        elif line.startswith("data:"):
+                            data_lines.append(line.split(":", 1)[1].lstrip())
+                        continue
+                    if not data_lines:
+                        continue
+                    blob = "\n".join(data_lines)
+                    data_lines = []
+                    event_name = None
+                    if blob == "[DONE]":
+                        continue
+                    try:
+                        payload = json.loads(blob)
+                    except Exception:
+                        continue
+                    et = payload.get("type") or ""
+                    if et == "response.output_text.delta":
+                        text_parts.append(payload.get("delta", ""))
+                    elif et == "response.output_item.added":
+                        item = payload.get("item") or {}
+                        if item.get("type") == "function_call":
+                            calls[item.get("id")] = {
+                                "call_id": item.get("call_id"),
+                                "name": item.get("name"),
+                                "arguments": item.get("arguments") or "",
+                            }
+                    elif et == "response.function_call_arguments.delta":
+                        cid = payload.get("item_id")
+                        if cid in calls:
+                            calls[cid]["arguments"] += payload.get("delta", "")
+                    elif et == "response.function_call_arguments.done":
+                        cid = payload.get("item_id")
+                        if cid in calls and payload.get("arguments"):
+                            calls[cid]["arguments"] = payload.get("arguments")
+                    elif et == "response.completed":
+                        response = payload.get("response") or {}
+                        if not text_parts:
+                            text_parts.append(extract_completed_output(response))
+                        usage = parse_codex_direct_usage(response.get("usage"))
+                    elif et in {"response.failed", "response.incomplete"}:
+                        response = payload.get("response") or {}
+                        err = response.get("error") or payload.get("error") or {}
+                        raise RuntimeError(f"{et}: {json.dumps(err, ensure_ascii=False)[:400]}")
+        except urllib.error.HTTPError as exc:
+            body_text = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"codex agent HTTP {exc.code}: {body_text[:400]}") from exc
+        return "".join(text_parts), list(calls.values()), usage
+
+    return with_codex_retry(config, _attempt, "codex_agent")
 
 
 def run_codex_agent_triage(config, record, row, model, max_rounds=6):
@@ -2141,34 +2197,39 @@ def call_codex_direct_source_batch(config, model, batch):
         headers=load_codex_auth_headers(),
     )
 
-    output_chunks = []
-    usage = {}
     started = time.perf_counter()
-    try:
-        with urllib.request.urlopen(req, timeout=float(llm.get("timeout_seconds", 180))) as resp:
-            event_name = None
-            data_lines = []
-            for raw_line in resp:
-                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-                if not line:
-                    if data_lines:
-                        event_type, text, event_usage, _ = handle_codex_direct_sse(event_name, "\n".join(data_lines))
-                        if text and (event_type != "response.completed" or not output_chunks):
-                            output_chunks.append(text)
-                        if event_usage is not None:
-                            usage = parse_codex_direct_usage(event_usage)
-                        if event_type == "response.completed":
-                            break
-                    event_name = None
-                    data_lines = []
-                    continue
-                if line.startswith("event:"):
-                    event_name = line.split(":", 1)[1].strip()
-                elif line.startswith("data:"):
-                    data_lines.append(line.split(":", 1)[1].lstrip())
-    except urllib.error.HTTPError as exc:
-        body_text = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"codex source review HTTP {exc.code}: {body_text[:800]}") from exc
+
+    def _attempt():
+        output_chunks = []
+        usage = {}
+        try:
+            with urllib.request.urlopen(req, timeout=float(llm.get("timeout_seconds", 180))) as resp:
+                event_name = None
+                data_lines = []
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if not line:
+                        if data_lines:
+                            event_type, text, event_usage, _ = handle_codex_direct_sse(event_name, "\n".join(data_lines))
+                            if text and (event_type != "response.completed" or not output_chunks):
+                                output_chunks.append(text)
+                            if event_usage is not None:
+                                usage = parse_codex_direct_usage(event_usage)
+                            if event_type == "response.completed":
+                                break
+                        event_name = None
+                        data_lines = []
+                        continue
+                    if line.startswith("event:"):
+                        event_name = line.split(":", 1)[1].strip()
+                    elif line.startswith("data:"):
+                        data_lines.append(line.split(":", 1)[1].lstrip())
+        except urllib.error.HTTPError as exc:
+            body_text = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"codex source review HTTP {exc.code}: {body_text[:800]}") from exc
+        return output_chunks, usage
+
+    output_chunks, usage = with_codex_retry(config, _attempt, "source_review")
 
     parsed = parse_llm_json("".join(output_chunks))
     results = extract_llm_results(parsed)
