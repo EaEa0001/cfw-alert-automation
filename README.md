@@ -16,6 +16,12 @@
 5. 保留确认成功、证据不足和高危告警，并发送企微通知。
 6. 每日生成告警汇总报告。
 
+### 源包抓取说明
+
+- HTTP 是唯一能稳定拿到应用层 payload 的协议:`netflow_nta` 按 `app_protocol=HTTP` 过滤(而非 `event_type`,后者会把部分本质 HTTP 的流标成 TCP),可解码请求头/响应头/响应体。
+- `netflow_nta` 的 `DescribeLogs` 仅对整点对齐的时间窗返回数据,带分秒边界会返回空;抓取时已将查询窗口下/上取整到整点。
+- TLS 为密文、UNKNOWN 无结构、纯 TCP/UDP 无 payload,均无法拉到内容,这类回退到聚合字段研判(证据不足时保留人工)。
+
 项目当前使用 `codex_direct`：读取本机 `~/.codex/auth.json` 的 Codex 登录鉴权，直接请求 Responses 接口并要求模型返回结构化 JSON。它不是 ReAct 工具调用循环，也没有通过 OpenAI SDK function call 驱动处置。腾讯云查询和处置由本地 Python 代码直接执行。
 
 ## 安装

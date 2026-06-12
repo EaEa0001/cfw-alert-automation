@@ -35,7 +35,9 @@
       "batch_size": 60,
       "max_groups_per_run": 200,
       "max_evidence_chars": 600,
-      "hydrate_missing_evidence": true
+      "hydrate_missing_evidence": true,
+      "review_all_with_evidence": true,
+      "netflow_fetch_limit": 100
     },
     "alert_center_auto_dispose": {
       "enabled": true,

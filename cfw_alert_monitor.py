@@ -909,9 +909,7 @@ def _netflow_evidence_from_record(record):
     not — request/response headers and the response body, hex-encoded. This is
     the only place internal (10.x/172.x → 10.x) lateral attacks leave a packet.
     """
-    if str(record.get("event_type") or "").upper() not in ("HTTP", ""):
-        # Only HTTP flows carry parseable request/response evidence.
-        pass
+    # 不看 event_type(可能被标成 TCP),只要能解出 HTTP 请求/响应内容就用。
     req_head = _decode_hex_blob(record.get("http_request_header"))
     req_body = _decode_hex_blob(record.get("http_request_body"), 1024)
     resp_head = _decode_hex_blob(record.get("http_response_header"))
@@ -945,7 +943,7 @@ def _netflow_evidence_from_record(record):
     return evidence
 
 
-def _netflow_logs_for_record(config, record, start_text, end_text, limit=60):
+def _netflow_logs_for_record(config, record, start_text, end_text, limit=None):
     """Fetch netflow_nta flows for this record's src IPs within the window.
 
     Filtered by src_ip to keep the query bounded (the raw index has tens of
@@ -953,6 +951,26 @@ def _netflow_logs_for_record(config, record, start_text, end_text, limit=60):
     src_ips = [str(ip) for ip in (record.get("SrcIpList") or []) if str(ip)]
     if not src_ips:
         return []
+    if limit is None:
+        source_cfg = (config.get("llm") or {}).get("source_review") or {}
+        limit = int(source_cfg.get("netflow_fetch_limit", 100))
+
+    # netflow_nta 的 DescribeLogs 只对整点对齐的时间窗返回数据,带分秒的边界
+    # (如 08:48:50)会返回 Total=0。把窗口 start 下取整、end 上取整到整点。
+    def _align(text, ceil):
+        try:
+            dt = datetime.strptime(str(text), "%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            return text
+        if dt.minute or dt.second:
+            dt = dt.replace(minute=0, second=0)
+            if ceil:
+                dt += timedelta(hours=1)
+        return dt_text(dt)
+
+    start_text = _align(start_text, ceil=False)
+    end_text = _align(end_text, ceil=True)
+
     client = build_client(config)
     out = []
     for src_ip in src_ips[:4]:
@@ -968,14 +986,17 @@ def _netflow_logs_for_record(config, record, start_text, end_text, limit=60):
             req.Offset = 0
             req.StartTime = start_text
             req.EndTime = end_text
-            # 只取 HTTP 流量(有可解析的请求/响应),跳过 TCP 元数据噪声,
-            # 否则繁忙 IP 的前几页全是 TCP,HTTP 证据被埋掉。
+            # 按 app_protocol=HTTP 过滤(不是 event_type):NTA 会把一部分本质是
+            # HTTP 的流标成 event_type=TCP,但 app_protocol 仍是 HTTP 且带响应体。
+            # 用 app_protocol 能把这批“伪装成 TCP 的 HTTP”一起捞回,提高命中率;
+            # 同时跳过纯 TCP 元数据噪声(无 payload)。TLS 是密文、UNKNOWN 无结构,
+            # 都解不出明文,不取。
             flt_ip = models.CommonFilter()
             flt_ip.Name = "src_ip"
             flt_ip.OperatorType = 1
             flt_ip.Values = [src_ip]
             flt_http = models.CommonFilter()
-            flt_http.Name = "event_type"
+            flt_http.Name = "app_protocol"
             flt_http.OperatorType = 1
             flt_http.Values = ["HTTP"]
             req.Filters = [flt_ip, flt_http]
