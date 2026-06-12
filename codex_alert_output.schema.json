@@ -1,0 +1,30 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "r": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "res": {
+            "type": "string",
+            "enum": ["确认成功", "确认未成功", "未见成功证据", "扫描探测", "需人工复核"]
+          },
+          "conf": {
+            "type": "string",
+            "enum": ["高", "中", "低"]
+          },
+          "succ": { "type": "string" },
+          "fail": { "type": "string" },
+          "why": { "type": "string" },
+          "next": { "type": "string" }
+        },
+        "required": ["id", "res", "conf", "succ", "fail", "why", "next"]
+      }
+    }
+  },
+  "required": ["r"]
+}

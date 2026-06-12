@@ -1,0 +1,58 @@
+{
+  "region": "ap-shanghai",
+  "endpoint": "cfw.tencentcloudapi.com",
+  "credential_profiles": [
+    "default"
+  ],
+  "tencent_scan_ips": [],
+  "company_scan_ips": [],
+  "lookback_hours": 1,
+  "daily_report_time": "17:50",
+  "wecom": {
+    "enabled": false,
+    "webhook_url": "",
+    "hourly_enabled": true,
+    "daily_enabled": true,
+    "notify_on_empty": true,
+    "timeout_seconds": 15,
+    "max_bytes": 3800
+  },
+  "llm": {
+    "enabled": true,
+    "provider": "codex_direct",
+    "model": "gpt-5.5",
+    "reasoning_effort": "medium",
+    "codex_responses_url": "https://chatgpt.com/backend-api/codex/responses",
+    "codex_path": "codex.cmd",
+    "max_workers": 3,
+    "batch_size": 80,
+    "timeout_seconds": 300,
+    "ignore_user_config": true,
+    "source_review": {
+      "enabled": true,
+      "reasoning_effort": "medium",
+      "batch_size": 60,
+      "max_groups_per_run": 200,
+      "max_evidence_chars": 420,
+      "hydrate_missing_evidence": true
+    },
+    "alert_center_auto_dispose": {
+      "enabled": true,
+      "lookback_hours": 2,
+      "timeout_seconds": 180
+    },
+    "auto_dispose": {
+      "enabled": true,
+      "ignore_results": [
+        "未见成功证据",
+        "扫描探测",
+        "确认未成功"
+      ],
+      "omit_table_type": "AlertTable",
+      "batch_size": 50,
+      "ids_white_enabled": true,
+      "ids_white_rule_type": "srcdst",
+      "ids_white_fw_type": 7
+    }
+  }
+}

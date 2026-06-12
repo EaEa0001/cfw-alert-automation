@@ -1,0 +1,25 @@
+# Local runtime configuration and credentials
+config.json
+.env
+.env.*
+
+# Runtime data
+data/
+logs/
+reports/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Temporary files
+*.tmp
+*.log
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
