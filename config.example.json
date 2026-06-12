@@ -39,6 +39,13 @@
       "review_all_with_evidence": true,
       "netflow_fetch_limit": 100
     },
+    "agent_triage": {
+      "enabled": false,
+      "reasoning_effort": "high",
+      "max_rounds": 6,
+      "max_alerts_per_run": 30,
+      "max_workers": 2
+    },
     "alert_center_auto_dispose": {
       "enabled": true,
       "lookback_hours": 2,

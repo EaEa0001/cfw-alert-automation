@@ -552,7 +552,7 @@ def apply_judgements(rows, judgements):
         # 源包证据是 dict,序列化成紧凑文本方便落 CSV
         if isinstance(merged.get("源包证据"), dict):
             merged["源包证据"] = json.dumps(merged["源包证据"], ensure_ascii=False, separators=(",", ":"))
-        for key in ("模型研判", "模型置信度", "研判理由", "关键证据", "下一步", "研判来源", "研判模型", "输入Token", "输出Token", "推理Token"):
+        for key in ("模型研判", "模型置信度", "研判理由", "关键证据", "下一步", "研判来源", "研判模型", "工具轨迹", "输入Token", "输出Token", "推理Token"):
             merged[key] = item.get(key, "")
         out.append(merged)
     return out
@@ -731,6 +731,7 @@ def main():
         "下一步",
         "研判来源",
         "研判模型",
+        "工具轨迹",
         "输入Token",
         "输出Token",
         "推理Token",

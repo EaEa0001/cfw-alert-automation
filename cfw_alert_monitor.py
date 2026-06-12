@@ -1720,6 +1720,294 @@ def call_codex_direct_batch(config, model, batch):
     return by_key, usage
 
 
+# =========================================================================
+# Agent 工具循环研判(复用 Codex 订阅,无需 API key)
+#
+# 与单轮研判的区别:给模型一组“只读取证”工具,模型自己决定取哪些证、取几轮,
+# 最后基于真实证据给出带证据链的结论。所有工具只读取证,绝不处置 —— 忽略/加白
+# 仍由本地规则代码执行,模型不碰云资源,保住安全边界。
+# =========================================================================
+
+TRIAGE_TOOLS = [
+    {
+        "type": "function",
+        "name": "pull_packets",
+        "description": (
+            "拉取指定攻击源IP在该告警时间窗内的真实源数据包(HTTP请求行、响应状态、"
+            "响应体片段、命令回显标记)。判断攻击是否成功前应优先调用。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ip": {"type": "string", "description": "攻击源IP,取告警的源IP之一"},
+            },
+            "required": ["ip"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "decode_hex",
+        "description": "把源包里的hex编码片段解码成明文文本,用于看清响应体或载荷内容。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "hex": {"type": "string", "description": "hex字符串"},
+            },
+            "required": ["hex"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "get_related_alerts",
+        "description": "查同一攻击源IP在近几天的其他未处理告警,判断是否在持续攻击或多点尝试。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ip": {"type": "string", "description": "攻击源IP"},
+                "days": {"type": "integer", "description": "回溯天数,默认2"},
+            },
+            "required": ["ip"],
+        },
+    },
+]
+
+
+def _tool_pull_packets(config, record, args):
+    ip = str(args.get("ip") or "")
+    # 用告警自身的时间窗;若指定了某个 IP,临时收窄到该 IP 提高相关性
+    sub = dict(record)
+    if ip:
+        sub["SrcIpList"] = [ip]
+    evidence = fetch_source_evidence_for_record(config, sub)
+    if not evidence:
+        return {"found": False, "note": "该IP在时间窗内无可解析HTTP源包(可能为非HTTP流量)"}
+    # 精简返回,避免塞爆上下文
+    out = {k: v for k, v in evidence.items() if k in (
+        "req", "resp", "resp_mark", "resp_body", "req_mark", "cmd", "host", "ua", "ar", "flow")}
+    out["found"] = True
+    return out
+
+
+def _tool_decode_hex(config, record, args):
+    text = _decode_hex_blob(args.get("hex"), max_bytes=2048)
+    return {"text": text[:1000]} if text else {"text": "", "note": "无法解码"}
+
+
+def _tool_get_related_alerts(config, record, args):
+    ip = str(args.get("ip") or "")
+    days = int(args.get("days") or 2)
+    try:
+        import cfw_alert_center_triage as triage
+        records, _ = triage.fetch_unhandled_alert_center(config, days)
+    except Exception as exc:
+        return {"error": str(exc)[:200]}
+    related = []
+    for r in records:
+        if ip in [str(x) for x in (r.get("SrcIpList") or [])]:
+            related.append({
+                "event": str(r.get("EventName") or ""),
+                "level": str(r.get("Level") or ""),
+                "time": str(r.get("EndTime") or ""),
+                "ar": str(r.get("AttackResult") or ""),
+            })
+    return {"ip": ip, "count": len(related), "alerts": related[:15]}
+
+
+TOOL_DISPATCH = {
+    "pull_packets": _tool_pull_packets,
+    "decode_hex": _tool_decode_hex,
+    "get_related_alerts": _tool_get_related_alerts,
+}
+
+
+def dispatch_tool(name, args, config, record):
+    fn = TOOL_DISPATCH.get(name)
+    if not fn:
+        return {"error": f"unknown tool {name}"}
+    try:
+        return fn(config, record, args or {})
+    except Exception as exc:
+        return {"error": str(exc)[:300]}
+
+
+def _agent_request_body(model, input_items, reasoning_effort):
+    return {
+        "model": model,
+        "instructions": (
+            "你是资深安全告警研判员。判断云防火墙告警攻击是否成功,必须基于工具取到的"
+            "真实证据,不能凭聚合字段或请求特征臆断。可多次调用工具取证。"
+            "得到足够证据后,只输出一个紧凑JSON对象(不要解释、不要数组),字段:"
+            "result(确认成功/确认未成功/未见成功证据/扫描探测/需人工复核),"
+            "confidence(high/medium/low),evidence(判定依据,≤40汉字),"
+            "next(下一步,≤20汉字),key_evidence(支撑结论的源包原文片段,≤120字符,无则空串)。"
+            "确认成功必须有命令回显/文件写入/webshell/敏感数据返回/回连等明确落地证据;"
+            "单独HTTP200、普通页面不算成功。"
+        ),
+        "input": input_items,
+        "tools": TRIAGE_TOOLS,
+        "tool_choice": "auto",
+        "parallel_tool_calls": False,
+        "reasoning": {"effort": reasoning_effort},
+        "store": False,
+        "stream": True,
+        "include": [],
+    }
+
+
+def _agent_stream_once(config, body):
+    """发一轮请求,流式收集:最终文本、本轮发起的 function_call 列表、usage。"""
+    llm = config.get("llm") or {}
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        llm.get("codex_responses_url") or CODEX_RESPONSES_URL,
+        data=data, method="POST", headers=load_codex_auth_headers(),
+    )
+    text_parts = []
+    calls = {}  # item_id -> {call_id,name,arguments}
+    usage = {}
+    with urllib.request.urlopen(req, timeout=float(llm.get("timeout_seconds", 180))) as resp:
+        event_name = None
+        data_lines = []
+        for raw in resp:
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            if line:
+                if line.startswith("event:"):
+                    event_name = line.split(":", 1)[1].strip()
+                elif line.startswith("data:"):
+                    data_lines.append(line.split(":", 1)[1].lstrip())
+                continue
+            if not data_lines:
+                continue
+            blob = "\n".join(data_lines)
+            data_lines = []
+            event_name = None
+            if blob == "[DONE]":
+                continue
+            try:
+                payload = json.loads(blob)
+            except Exception:
+                continue
+            et = payload.get("type") or ""
+            if et == "response.output_text.delta":
+                text_parts.append(payload.get("delta", ""))
+            elif et == "response.output_item.added":
+                item = payload.get("item") or {}
+                if item.get("type") == "function_call":
+                    calls[item.get("id")] = {
+                        "call_id": item.get("call_id"),
+                        "name": item.get("name"),
+                        "arguments": item.get("arguments") or "",
+                    }
+            elif et == "response.function_call_arguments.delta":
+                cid = payload.get("item_id")
+                if cid in calls:
+                    calls[cid]["arguments"] += payload.get("delta", "")
+            elif et == "response.function_call_arguments.done":
+                cid = payload.get("item_id")
+                if cid in calls and payload.get("arguments"):
+                    calls[cid]["arguments"] = payload.get("arguments")
+            elif et == "response.completed":
+                response = payload.get("response") or {}
+                if not text_parts:
+                    text_parts.append(extract_completed_output(response))
+                usage = parse_codex_direct_usage(response.get("usage"))
+            elif et in {"response.failed", "response.incomplete"}:
+                response = payload.get("response") or {}
+                err = response.get("error") or payload.get("error") or {}
+                raise RuntimeError(f"{et}: {json.dumps(err, ensure_ascii=False)[:400]}")
+    return "".join(text_parts), list(calls.values()), usage
+
+
+def run_codex_agent_triage(config, record, row, model, max_rounds=6):
+    """对单条告警跑工具循环研判,返回研判 dict(含证据链),失败返回 None。"""
+    llm = config.get("llm") or {}
+    agent_cfg = llm.get("agent_triage") or {}
+    effort = agent_cfg.get("reasoning_effort", "high")
+    max_rounds = int(agent_cfg.get("max_rounds", max_rounds))
+
+    seed = {
+        "告警ID": row.get("告警ID"),
+        "事件名称": row.get("事件名称"),
+        "告警等级": row.get("告警等级"),
+        "攻击IP": row.get("攻击IP"),
+        "目标IP": row.get("目标IP"),
+        "威胁描述": row.get("威胁描述"),
+    }
+    input_items = [{
+        "type": "message", "role": "user",
+        "content": [{"type": "input_text",
+                     "text": "研判这条告警,先用工具取证再下结论。告警=" +
+                             json.dumps(seed, ensure_ascii=False, separators=(",", ":"))}],
+    }]
+    agg_usage = {"input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0}
+    tool_trace = []
+    for round_idx in range(max_rounds):
+        # 最后一轮强制收尾:tool_choice=none,模型必须给结论而不能再调工具,
+        # 避免一直调工具撞轮数上限后返回 None。
+        last_round = round_idx == max_rounds - 1
+        body = _agent_request_body(model, input_items, effort)
+        if last_round:
+            body["tool_choice"] = "none"
+        text, calls, usage = _agent_stream_once(config, body)
+        for k in agg_usage:
+            try:
+                agg_usage[k] += int(usage.get(k) or 0)
+            except (TypeError, ValueError):
+                pass
+        if calls and not last_round:
+            for call in calls:
+                try:
+                    args = json.loads(call["arguments"]) if call["arguments"] else {}
+                except Exception:
+                    args = {}
+                result = dispatch_tool(call["name"], args, config, record)
+                tool_trace.append({"tool": call["name"], "args": args})
+                # 把模型的 function_call 与我们的执行结果都回填,模型才能续推
+                input_items.append({
+                    "type": "function_call",
+                    "call_id": call["call_id"],
+                    "name": call["name"],
+                    "arguments": call["arguments"],
+                })
+                input_items.append({
+                    "type": "function_call_output",
+                    "call_id": call["call_id"],
+                    "output": json.dumps(result, ensure_ascii=False)[:4000],
+                })
+            continue  # 有工具调用,进入下一轮让模型看结果
+        # 无工具调用 = 最终结论
+        parsed = _parse_agent_final(text)
+        if not parsed:
+            return None
+        parsed["研判来源"] = "codex_agent"
+        parsed["研判模型"] = model
+        parsed["工具轨迹"] = ";".join(t["tool"] for t in tool_trace)
+        parsed["输入Token"] = str(agg_usage["input_tokens"])
+        parsed["输出Token"] = str(agg_usage["output_tokens"])
+        parsed["推理Token"] = str(agg_usage["reasoning_output_tokens"])
+        return parsed
+    return None  # 超过轮数上限仍未收敛
+
+
+def _parse_agent_final(text):
+    try:
+        parsed = parse_llm_json(text)
+    except Exception:
+        return None
+    if isinstance(parsed, list):
+        parsed = parsed[0] if parsed else {}
+    if not isinstance(parsed, dict):
+        return None
+    result = normalize_direct_result(parsed.get("result") or parsed.get("模型研判"))
+    return {
+        "模型研判": result,
+        "模型置信度": normalize_confidence(parsed.get("confidence") or parsed.get("模型置信度")),
+        "研判理由": str(parsed.get("evidence") or parsed.get("研判理由") or "")[:120],
+        "下一步": str(parsed.get("next") or parsed.get("下一步") or "")[:80],
+        "关键证据": str(parsed.get("key_evidence") or parsed.get("关键证据") or "")[:160],
+    }
+
+
 def source_review_enabled(config):
     llm = config.get("llm") or {}
     source_cfg = llm.get("source_review") or {}
@@ -2055,7 +2343,61 @@ def llm_judge_rows(config, rows):
                     }
                 else:
                     results[key] = fallback_judgement(row, "rule_fallback_model_parse_error", model)
-    return refine_judgements_with_source(config, rows, results, model)
+    results = refine_judgements_with_source(config, rows, results, model)
+    return escalate_with_agent(config, rows, results, model)
+
+
+def escalate_with_agent(config, rows, judgements, model):
+    """对高危/需人工复核的告警升级为 Agent 工具循环研判(模型自主取证)。
+
+    只对值得的子集开(贵+慢),Agent 失败保留原判。可用 agent_triage.enabled 关闭。
+    """
+    llm = config.get("llm") or {}
+    agent_cfg = llm.get("agent_triage") or {}
+    if not (llm.get("provider") == "codex_direct" and agent_cfg.get("enabled", False)):
+        return judgements
+
+    max_alerts = int(agent_cfg.get("max_alerts_per_run", 30))
+    max_workers = max(1, int(agent_cfg.get("max_workers", 2)))
+
+    targets = []
+    for row in rows:
+        key = judgement_key(row)
+        cur = judgements.get(key) or {}
+        result = cur.get("模型研判")
+        level = row.get("告警等级")
+        # 升级条件:高危,或仍需人工复核(单轮+源包都没定论的),才值得多轮深挖
+        if level == "高危" or result == "需人工复核":
+            targets.append((key, row))
+        if len(targets) >= max_alerts:
+            break
+    if not targets:
+        return judgements
+
+    record_by_key = {judgement_key(row): row.get("_record") for row in rows}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(run_codex_agent_triage, config, record_by_key.get(key) or {}, row, model): key
+            for key, row in targets
+        }
+        for future in as_completed(future_map):
+            key = future_map[future]
+            try:
+                agent_result = future.result()
+            except Exception as exc:
+                append_llm_error("codex_agent", model, [], exc)
+                continue
+            if not agent_result:
+                continue
+            merged = dict(judgements.get(key) or {})
+            merged.update(agent_result)
+            # 安全闸:Agent 判“确认成功”但行内无成功源包证据时,降回未见成功证据
+            row = next((r for k, r in targets if k == key), None)
+            if row is not None and agent_result.get("模型研判") == "确认成功" and not has_success_source_evidence(row):
+                merged["模型研判"] = "未见成功证据"
+                merged["研判理由"] = "Agent判成功但无落地源包证据"
+            judgements[key] = merged
+    return judgements
 
 
 def append_llm_error(provider, model, batch, exc):
