@@ -232,6 +232,59 @@ def health(days=7):
     }
 
 
+def profiles(days=7, limit=50):
+    """读取最近 N 天的攻击者画像(每次运行落一条 summary,取并集后按评分去重)。"""
+    cutoff = datetime.now() - timedelta(days=days)
+    by_ip = {}
+    for path in sorted(glob.glob(str(DATA_DIR / "attacker-profile-*.jsonl"))):
+        for rec in _read_jsonl(path):
+            at = _parse_time(rec.get("recorded_at"))
+            if at and at < cutoff:
+                continue
+            run_at = rec.get("recorded_at", "")
+            for p in rec.get("top_profiles", []):
+                ip = p.get("ip")
+                if not ip:
+                    continue
+                p = dict(p, _run_at=run_at)
+                prev = by_ip.get(ip)
+                # 同一 IP 保留最新运行的画像
+                if not prev or run_at >= prev.get("_run_at", ""):
+                    by_ip[ip] = p
+    out = list(by_ip.values())
+    out.sort(key=lambda p: -(p.get("profile", {}).get("final_score", 0)))
+    # 拍平成前端友好的结构
+    flat = []
+    for p in out[:limit]:
+        pr = p.get("profile", {})
+        flat.append({
+            "ip": p.get("ip", ""),
+            "internal": p.get("internal", False),
+            "country": p.get("country", ""),
+            "attacker_type": pr.get("attacker_type", ""),
+            "intent": pr.get("intent", ""),
+            "stage": pr.get("stage", ""),
+            "narrative": pr.get("narrative", ""),
+            "score": pr.get("final_score", p.get("rule_score", 0)),
+            "rule_score": p.get("rule_score", 0),
+            "band": p.get("band", ""),
+            "recommendation": pr.get("recommendation", ""),
+            "alert_count": p.get("alert_count", 0),
+            "technique_kinds": p.get("technique_kinds", 0),
+            "target_count": p.get("target_count", 0),
+            "killchain_max": p.get("killchain_max", ""),
+            "high": p.get("high", 0),
+            "cloud_success": p.get("cloud_success", 0),
+            "span_hours": p.get("span_hours", 0),
+            "first_seen": p.get("first_seen", ""),
+            "last_seen": p.get("last_seen", ""),
+            "events": p.get("events", {}),
+            "targets": p.get("targets", []),
+            "run_at": p.get("_run_at", ""),
+        })
+    return flat
+
+
 def full_report(days=7):
     return {
         "overview": overview(days),

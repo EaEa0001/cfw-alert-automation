@@ -36,6 +36,11 @@ def api_health():
     return jsonify(stats.health(_days()))
 
 
+@app.route("/api/profiles")
+def api_profiles():
+    return jsonify(stats.profiles(_days()))
+
+
 @app.route("/api/alerts")
 def api_alerts():
     return jsonify(stats.alerts(
@@ -100,6 +105,24 @@ PAGE = r"""<!doctype html>
   .tabletall { max-height:560px; overflow:auto; }
   .err { color:var(--hi); }
   .muted { color:var(--mut); }
+  .tabs { display:inline-flex; gap:4px; }
+  .tab { background:transparent; border:1px solid var(--line); }
+  .tab.active { background:var(--acc); color:#0f1419; border-color:var(--acc); }
+  .acard { background:var(--card); border:1px solid var(--line); border-left:3px solid var(--mut);
+           border-radius:10px; padding:14px 16px; margin-bottom:12px; }
+  .acard.b-高危 { border-left-color:var(--hi); }
+  .acard.b-关注 { border-left-color:var(--warn); }
+  .acard .top { display:flex; justify-content:space-between; align-items:baseline; gap:12px; flex-wrap:wrap; }
+  .acard .ip { font-size:16px; font-weight:600; font-family:Consolas,monospace; }
+  .acard .score { font-size:24px; font-weight:700; }
+  .acard .score.高危 { color:var(--hi); } .acard .score.关注 { color:var(--warn); } .acard .score.一般 { color:var(--mut); }
+  .acard .narr { margin:8px 0; line-height:1.6; }
+  .acard .meta { color:var(--mut); font-size:12px; display:flex; gap:16px; flex-wrap:wrap; }
+  .acard .seq { margin-top:8px; font-size:12px; color:var(--mut); }
+  .chip { display:inline-block; background:#11161f; border:1px solid var(--line); border-radius:4px;
+          padding:1px 7px; margin:2px 4px 2px 0; font-size:11.5px; }
+  .rec { display:inline-block; margin-top:8px; padding:2px 10px; border-radius:6px; font-size:12px;
+         background:#3d1f1f; color:var(--hi); }
 </style>
 </head>
 <body>
@@ -115,9 +138,14 @@ PAGE = r"""<!doctype html>
     </select>
   </label>
   <button onclick="loadAll()">刷新</button>
+  <span class="tabs">
+    <button id="tab-overview" class="tab active" onclick="switchView('overview')">研判总览</button>
+    <button id="tab-attackers" class="tab" onclick="switchView('attackers')">攻击者画像</button>
+  </span>
   <span id="updated" class="muted"></span>
 </header>
-<div class="wrap">
+
+<div class="wrap view" id="view-overview">
   <div class="cards" id="cards"></div>
 
   <div class="grid2">
@@ -145,6 +173,11 @@ PAGE = r"""<!doctype html>
     </div>
     <div class="tabletall"><table id="alertTable"></table></div>
   </div>
+</div>
+
+<div class="wrap view" id="view-attackers" style="display:none">
+  <div class="cards" id="attackerCards"></div>
+  <div id="attackerList"></div>
 </div>
 
 <script>
@@ -246,8 +279,61 @@ function detail(r){
 function toggle(i){ const d=$('#d'+i); d.style.display = d.style.display==='block'?'none':'block'; }
 function esc(s){ return String(s==null?'':s).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 
+let currentView = 'overview';
+function switchView(v){
+  currentView = v;
+  $('#view-overview').style.display = v==='overview'?'':'none';
+  $('#view-attackers').style.display = v==='attackers'?'':'none';
+  $('#tab-overview').classList.toggle('active', v==='overview');
+  $('#tab-attackers').classList.toggle('active', v==='attackers');
+  if(v==='attackers') loadAttackers();
+}
+
+async function loadAttackers(){
+  const list = await get('/api/profiles');
+  const bands = {高危:0, 关注:0, 一般:0};
+  list.forEach(p => bands[p.band] = (bands[p.band]||0)+1);
+  $('#attackerCards').innerHTML =
+    card('画像总数', list.length) +
+    card('高危攻击者', bands['高危']||0) +
+    card('关注', bands['关注']||0) +
+    card('内网源', list.filter(p=>p.internal).length) +
+    card('已得手', list.filter(p=>p.cloud_success>0).length);
+
+  if(!list.length){
+    $('#attackerList').innerHTML = '<div class="panel muted">暂无画像数据。运行 <code>python attacker_profile.py --days 2</code> 或等日报任务生成。</div>';
+    return;
+  }
+  $('#attackerList').innerHTML = list.map(p=>{
+    const seq = Object.entries(p.events||{}).sort((a,b)=>b[1]-a[1]).slice(0,8)
+      .map(([k,v])=>`<span class="chip">${esc(k)} ×${v}</span>`).join('');
+    const src = p.internal ? '内网源' : ('公网源 ' + esc(p.country||''));
+    return `<div class="acard b-${p.band}">
+      <div class="top">
+        <div>
+          <span class="ip">${esc(p.ip)}</span>
+          <span class="muted"> · ${src} · ${esc(p.attacker_type||'未知')}</span>
+        </div>
+        <div class="score ${p.band}">${p.score}<span class="muted" style="font-size:12px"> / 100</span></div>
+      </div>
+      <div class="narr">${esc(p.narrative||'-')}</div>
+      <div class="meta">
+        <span>意图: ${esc(p.intent||'-')}</span>
+        <span>阶段: <b>${esc(p.stage||'-')}</b></span>
+        <span>杀伤链最深: ${esc(p.killchain_max||'-')}</span>
+        <span>告警 ${p.alert_count} · 手法 ${p.technique_kinds} · 目标 ${p.target_count} · 跨度 ${p.span_hours}h</span>
+        <span>高危 ${p.high} · 得手 ${p.cloud_success}</span>
+      </div>
+      <div class="seq">手法序列: ${seq}</div>
+      ${p.recommendation?`<div class="rec">处置建议: ${esc(p.recommendation)}</div>`:''}
+      <div class="muted" style="font-size:11px;margin-top:6px">活动 ${esc((p.first_seen||'').slice(5,16))} ~ ${esc((p.last_seen||'').slice(5,16))} · 画像于 ${esc(p.run_at||'')}</div>
+    </div>`;
+  }).join('');
+}
+
 function loadAll(){
   loadOverview(); loadTrend(); loadHealth(); loadAlerts();
+  if(currentView==='attackers') loadAttackers();
   $('#updated').textContent = '更新于 ' + new Date().toLocaleTimeString();
 }
 loadAll();
