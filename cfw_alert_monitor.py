@@ -80,14 +80,15 @@ def truncate_utf8(value, max_bytes=3800):
     return raw[:limit].decode("utf-8", errors="ignore") + suffix
 
 
-def send_wecom_markdown(config, content, notification_type):
+def send_wecom_markdown(config, content, notification_type, webhook_override=None):
     notify_cfg = wecom_config(config)
     result = {
         "enabled": bool(notify_cfg.get("enabled", False)),
         "type": notification_type,
         "sent": False,
     }
-    webhook_url = str(notify_cfg.get("webhook_url") or "").strip()
+    # 可传独立 webhook(如"需人工研判"专用群);不传则用默认企微机器人
+    webhook_url = str(webhook_override or notify_cfg.get("webhook_url") or "").strip()
     if not result["enabled"]:
         result["reason"] = "disabled"
         return result
@@ -121,6 +122,73 @@ def send_wecom_markdown(config, content, notification_type):
         [dict(result, recorded_at=dt_text(now_local()))],
     )
     return result
+
+
+def send_wecom_text(config, content, notification_type, webhook_override=None, mentioned_list=None):
+    """发企微 text 消息。text 类型支持 @(markdown 不支持),用于需人工研判 @所有人。"""
+    notify_cfg = wecom_config(config)
+    result = {"enabled": bool(notify_cfg.get("enabled", False)), "type": notification_type, "sent": False}
+    webhook_url = str(webhook_override or notify_cfg.get("webhook_url") or "").strip()
+    if not result["enabled"]:
+        result["reason"] = "disabled"
+        return result
+    if not webhook_url:
+        result["reason"] = "missing_webhook_url"
+        return result
+    text = {"content": truncate_utf8(content, int(notify_cfg.get("max_bytes", 3800)))}
+    if mentioned_list:
+        text["mentioned_list"] = mentioned_list
+    request = urllib.request.Request(
+        webhook_url,
+        data=json.dumps({"msgtype": "text", "text": text}, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=int(notify_cfg.get("timeout_seconds", 15))) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+        result["response"] = response_payload
+        result["sent"] = int(response_payload.get("errcode", -1)) == 0
+        if not result["sent"]:
+            result["reason"] = response_payload.get("errmsg") or "wecom_api_error"
+    except Exception as exc:
+        result["reason"] = str(exc)
+    return result
+
+
+def push_manual_review_wecom(config, items, title="需人工研判告警"):
+    """企微 bot 专推"需人工复核"+"确认成功"的告警卡片。
+
+    与小时/日报汇总用同一个企微机器人;也可在 wecom.manual_webhook_url 配独立群。
+    """
+    notify_cfg = wecom_config(config)
+    if not notify_cfg.get("enabled", False) or not notify_cfg.get("manual_enabled", True):
+        return {"sent": False, "reason": "disabled"}
+    if not items:
+        return {"sent": False, "reason": "no_items"}
+    limit = int(notify_cfg.get("manual_max_items", 10))
+    lines = [f"## 🔔 {title}（{len(items)} 条需处理）", ""]
+    for it in items[:limit]:
+        t = str(it.get("告警时间", ""))[5:16]
+        lines.append(f"**[{it.get('告警等级','')}] {it.get('事件名称','')}**")
+        lines.append(f"> 攻击IP：{it.get('攻击IP','')}　目标：{it.get('目标IP','')}")
+        lines.append(f"> 研判：**{it.get('模型研判','')}**　{it.get('研判理由','')}")
+        if it.get("关键证据"):
+            lines.append(f"> 证据：{str(it.get('关键证据'))[:80]}")
+        lines.append(f"> 时间：{t}")
+        lines.append("")
+    if len(items) > limit:
+        lines.append(f"> ……另有 {len(items) - limit} 条，见控制台")
+    webhook = notify_cfg.get("manual_webhook_url") or None
+    # markdown 卡片(带格式)+ text @所有人(markdown 不支持 @,故补一条 text)
+    card = send_wecom_markdown(config, "\n".join(lines).strip(), "manual_review", webhook_override=webhook)
+    at_result = {"sent": False, "reason": "disabled"}
+    if notify_cfg.get("manual_at_all", True):
+        high = sum(1 for it in items if it.get("告警等级") == "高危")
+        at_text = f"⚠️ 有 {len(items)} 条告警需人工研判（高危 {high}），请及时处理。详情见上方卡片。"
+        at_result = send_wecom_text(config, at_text, "manual_review_at",
+                                    webhook_override=webhook, mentioned_list=["@all"])
+    return {"sent": card.get("sent"), "card": card, "at_all": at_result}
 
 
 def counter_text(counter, order=None, limit=6):

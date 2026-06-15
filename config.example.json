@@ -15,7 +15,11 @@
     "daily_enabled": true,
     "notify_on_empty": true,
     "timeout_seconds": 15,
-    "max_bytes": 3800
+    "max_bytes": 3800,
+    "manual_enabled": true,
+    "manual_at_all": true,
+    "manual_max_items": 10,
+    "manual_webhook_url": ""
   },
   "llm": {
     "enabled": true,
@@ -71,10 +75,5 @@
       "ids_white_rule_type": "srcdst",
       "ids_white_fw_type": 7
     }
-  },
-  "weclaw": {
-    "enabled": false,
-    "max_items": 10,
-    "to_user_id": ""
   }
 }
