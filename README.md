@@ -149,6 +149,10 @@ python .\triage_stats.py --days 7          # 文字报表
 python .\triage_stats.py --days 7 --json   # 完整 JSON
 ```
 
+## 自动忽略覆盖
+
+告警中心安全处置(`llm.alert_center_auto_dispose`)的 `lookback_hours` 决定每次小时任务回看多久的未处理告警。设为 24 表示**每小时扫全天积压并忽略**,避免 2 小时窗口外的告警堆积到日报才清。已处理的告警自动排除,`deep_triage_max` 封顶模型成本,`timeout_seconds` 控制在计划任务时限内。只忽略规则可定(4xx/扫描)与模型确认无害的结果,确认成功/高危一律保留。
+
 ## 安全边界
 
 - 工具不会自动封禁攻击 IP。

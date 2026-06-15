@@ -57,7 +57,7 @@
     },
     "alert_center_auto_dispose": {
       "enabled": true,
-      "lookback_hours": 2,
+      "lookback_hours": 24,
       "timeout_seconds": 600,
       "deep_triage": true,
       "deep_triage_max": 120
