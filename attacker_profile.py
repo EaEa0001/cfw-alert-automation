@@ -108,12 +108,17 @@ def rule_score(a):
     score += min(a["technique_kinds"] * 6, 40)        # 手法越多越像有目标攻击者
     score += min(a["alert_count"], 15)                # 频次
     score += a["high"] * 5                            # 高危告警
-    if a["killchain_max"] in ("横向移动", "命令控制", "数据窃取", "影响破坏"):
-        score += 20                                   # 已推进到利用之后的阶段
+    # 真实落地信号(木马/webshell/回连)才是高危依据;KillChain="横向移动" 只是腾讯云对
+    # 内网→内网流量的默认打标,不能当作真横向证据,否则内网业务全被抬成高危。
+    events_text = " ".join(a["events"].keys())
+    landed = any(k in events_text for k in ("njRAT", "木马", "webshell", "WebShell", "反弹", "回连"))
+    if landed:
+        score += 25
     if a["cloud_success"]:
-        score += 15
-    if a["internal"]:
-        score += 10                                   # 内网横向更值得警惕
+        score += 20
+    # 内网源仅在有落地信号时才加权;无证据的内网告警不额外抬分(多为业务误报)
+    if a["internal"] and (landed or a["cloud_success"]):
+        score += 10
     return min(score, 100)
 
 
@@ -143,17 +148,29 @@ def build_profile_prompt(a):
         "云端标记成功数": a["cloud_success"],
         "活动时间跨度小时": a["span_hours"],
     }
+    # 抓一条该源的真实源包样本,让模型据此区分"真攻击" vs "内网业务被误报"
+    if a.get("evidence_sample"):
+        payload["源包样本"] = a["evidence_sample"]
     return (
         "你是资深威胁分析师。基于一个攻击源IP在时间窗内的全部告警聚合,给出攻击者画像。"
         "只输出一个紧凑JSON对象,字段:"
-        "attacker_type(自动化扫描器/脚本小子/有目标的攻击者/疑似APT/内部异常),"
+        "attacker_type(自动化扫描器/脚本小子/有目标的攻击者/疑似APT/内部异常/正常业务误报),"
         "intent(攻击意图,≤30汉字),"
-        "stage(当前杀伤链阶段判断,取:侦察/利用尝试/已利用/横向/控制/窃取),"
+        "stage(当前杀伤链阶段判断,取:侦察/利用尝试/已利用/横向/控制/窃取/无),"
         "narrative(攻击叙事,用1-2句话讲清这个IP先做了什么再做了什么有没有得手,≤80汉字),"
         "threat_score(0-100整数),"
         "recommendation(处置建议,取:封禁/重点监控/继续观察/忽略,可加简短理由,≤25汉字)。"
         "判断依据:手法越多样越集中越像有目标攻击者;纯单一扫描特征是扫描器;"
-        "内网源多手法是内部异常或横向;有云端成功或已达横向/控制阶段则威胁高。"
+        "有云端成功、木马通信(njRAT等)、命令回显或已达横向/控制阶段则威胁高。"
+        "内网源研判分级(关键,避免把正常业务误画成攻击者):"
+        "①若手法序列含木马通信(njRAT)/webshell/反弹回连,或云端标记成功数>0 → 真实威胁,"
+        "判'内部异常',threat_score≥70,recommendation='封禁'或'重点监控'(这条优先级最高,样本即使正常也按此判);"
+        "②否则若源包样本响应是正常业务(code:0/success/正常页面/error页/200空体)且无命令回显 → "
+        "'正常业务误报',threat_score≤20,recommendation='忽略';"
+        "③否则(内网源、无落地证据、样本也看不出明显攻击)→ 不要轻易判内部异常或横向,"
+        "判'内网可疑待确认',threat_score 30-45,recommendation='继续观察',"
+        "narrative如实说明'仅IDS规则告警,无落地证据,需人工确认是否业务'。"
+        "切忌仅凭'SQL注入/文件上传'这类规则名就判横向——这些规则在内网业务上极易误报。"
         "聚合=" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
 
@@ -257,11 +274,34 @@ def run(config, days=2, top=None, dry_run=False, push_band="高危"):
     for a in candidates:
         a["_rule_score"] = rule_score(a)
         a["_band"] = attacker_band(a["_rule_score"])
+        # 内网源抓一条真实源包样本,让模型据此区分真攻击 vs 业务误报
+        if a["internal"] and a.get("_records"):
+            try:
+                ev = monitor.fetch_source_evidence_for_record(config, a["_records"][0])
+                if ev:
+                    a["evidence_sample"] = {k: str(ev.get(k))[:200] for k in
+                                            ("req", "resp", "resp_mark", "resp_body", "cmd") if ev.get(k)}
+            except Exception:
+                pass
         profile = model_profile(config, a, model)
         if not profile:
             continue
-        # 综合评分:模型分与规则分取较高,避免任一侧漏判
-        final_score = max(profile["threat_score"], a["_rule_score"])
+        # 硬安全闸:聚合里只要有木马通信/webshell/云端成功等明确落地信号,
+        # 绝不允许被判成"正常业务误报"(防止单条正常样本误导模型漏掉真威胁)。
+        events_text = " ".join(a["events"].keys())
+        hard_landed = (a["cloud_success"] > 0 or
+                       any(k in events_text for k in ("njRAT", "木马", "webshell", "WebShell", "反弹", "回连")))
+        if hard_landed and profile.get("attacker_type") == "正常业务误报":
+            profile["attacker_type"] = "内部异常"
+            profile["narrative"] = "[强制保留] 含木马/得手信号," + profile.get("narrative", "")
+            profile["threat_score"] = max(profile["threat_score"], 70)
+
+        # 综合评分:一般取模型分与规则分较高避免漏判;模型确认"正常业务误报"且无硬落地信号时,
+        # 以模型低分为准(否则规则分会把误报又抬回高危,白修)。
+        if profile.get("attacker_type") == "正常业务误报":
+            final_score = min(profile["threat_score"], 20)
+        else:
+            final_score = max(profile["threat_score"], a["_rule_score"])
         profile["final_score"] = final_score
         record = {k: v for k, v in a.items() if not k.startswith("_")}
         record["rule_score"] = a["_rule_score"]

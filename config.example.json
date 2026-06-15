@@ -25,7 +25,7 @@
     "codex_responses_url": "https://chatgpt.com/backend-api/codex/responses",
     "codex_path": "codex.cmd",
     "max_workers": 3,
-    "batch_size": 80,
+    "batch_size": 40,
     "timeout_seconds": 300,
     "ignore_user_config": true,
     "retry": {

@@ -1275,6 +1275,45 @@ def fallback_judgement(row, source, model):
     }
 
 
+def salvage_json_objects(text):
+    """从被截断的 JSON 数组里抢救出所有完整的 {...} 对象。
+
+    大批次研判时模型输出可能超长被截断,导致整段 json.loads 失败、整批降级。
+    这里逐字符扫描配平花括号,把已经完整的对象一个个抠出来,避免整批丢失。
+    """
+    objs = []
+    depth = 0
+    start = -1
+    in_str = False
+    esc = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    chunk = text[start:i + 1]
+                    try:
+                        objs.append(json.loads(chunk))
+                    except json.JSONDecodeError:
+                        pass
+                    start = -1
+    return objs
+
+
 def parse_llm_json(text):
     text = (text or "").strip()
     if not text:
@@ -1286,9 +1325,16 @@ def parse_llm_json(text):
         return json.loads(text)
     except json.JSONDecodeError:
         match = re.search(r"(\[.*\]|\{.*\})", text, re.S)
-        if not match:
-            raise
-        return json.loads(match.group(0))
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+        # 截断抢救:抠出所有完整对象,至少保住一部分研判而非整批降级
+        salvaged = salvage_json_objects(text)
+        if salvaged:
+            return salvaged
+        raise
 
 
 def extract_llm_results(parsed):
@@ -2404,6 +2450,18 @@ def llm_judge_rows(config, rows):
                     }
                 else:
                     results[key] = fallback_judgement(row, "rule_fallback_model_parse_error", model)
+            # 整批 miss 说明该批次解析失败/返回空,记日志使其在控制台可见,
+            # 否则大批降级会静默发生(eval 已暴露过日报批次 90% 降级)。
+            miss = sum(1 for row in batch if not by_key.get(judgement_key(row)))
+            if miss and miss == len(batch):
+                append_jsonl(LOG_DIR / "llm-errors.jsonl", [{
+                    "time": dt_text(now_local()),
+                    "provider": provider + "_parse_miss",
+                    "model": model,
+                    "batch_size": len(batch),
+                    "error_type": "batch_all_fallback",
+                    "error": f"批次 {len(batch)} 条全部降级(解析失败或空响应)",
+                }])
     results = refine_judgements_with_source(config, rows, results, model)
     return escalate_with_agent(config, rows, results, model)
 
