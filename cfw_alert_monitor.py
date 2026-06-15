@@ -2512,6 +2512,23 @@ def refine_judgements_with_source(config, rows, judgements, model):
     return judgements
 
 
+def codex_reachable(config, timeout=6):
+    """轻量探测 Codex 接口可达性(只建连+读少量字节)。不可达返回 False。"""
+    llm = config.get("llm") or {}
+    url = llm.get("codex_responses_url") or CODEX_RESPONSES_URL
+    try:
+        body = json.dumps(codex_direct_request_body(llm.get("model", "gpt-5.5"), "ping", "low"),
+                          ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(url, data=body, method="POST", headers=load_codex_auth_headers())
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read(64)
+        return True
+    except urllib.error.HTTPError:
+        return True  # 服务器有响应(哪怕业务错误),说明网络通
+    except Exception:
+        return False
+
+
 def llm_judge_rows(config, rows):
     llm = config.get("llm") or {}
     model = llm.get("model", "gpt-5.5")
@@ -2521,6 +2538,12 @@ def llm_judge_rows(config, rows):
         return {judgement_key(row): fallback_judgement(row, "rule_fallback_llm_disabled", model) for row in rows}
 
     provider = llm.get("provider", "codex_cli")
+    # 连接预检:provider 为 codex_direct 且接口不可达时,整轮短路,全部降级
+    # (避免每条干等超时;这些会被上层重试队列接住,网络恢复时补判)。
+    if provider == "codex_direct" and llm.get("precheck", True):
+        if not codex_reachable(config, timeout=int(llm.get("precheck_timeout", 6))):
+            append_llm_error("precheck", model, [], RuntimeError("codex unreachable, skip LLM this run"))
+            return {judgement_key(row): fallback_judgement(row, "rule_fallback_codex_unreachable", model) for row in rows}
     batch_size = max(1, int(llm.get("batch_size", 8)))
     max_workers = max(1, int(llm.get("max_workers", 6)))
     batches = [rows[i : i + batch_size] for i in range(0, len(rows), batch_size)]

@@ -62,7 +62,8 @@
       "timeout_seconds": 780,
       "deep_triage": true,
       "deep_triage_max": 120,
-      "deep_lookback_hours": 2
+      "deep_lookback_hours": 2,
+      "retry_max_per_run": 60
     },
     "auto_dispose": {
       "enabled": true,
@@ -76,6 +77,8 @@
       "ids_white_enabled": true,
       "ids_white_rule_type": "srcdst",
       "ids_white_fw_type": 7
-    }
+    },
+    "precheck": true,
+    "precheck_timeout": 6
   }
 }

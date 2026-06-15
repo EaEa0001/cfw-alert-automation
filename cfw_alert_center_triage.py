@@ -468,6 +468,9 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
     deep_enabled = bool(alert_cfg.get("deep_triage", True)) and not dry_run
     deep_judgements = {}
     deep_ignore_ids = []
+    queue_consumed = 0
+    queue_resolved = 0
+    queue_enqueued = 0
     if deep_enabled:
         # 深度研判很贵(每条抓源包+两遍LLM+高危Agent),小时任务有超时限制,
         # 只对最近 deep_lookback_hours 的告警做深判;更早的积压交给日报(无紧超时)。
@@ -477,6 +480,7 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
         deep_cutoff = end_dt - timedelta(hours=deep_lookback) if end_dt else None
         decided_ids = {item["event_id"] for item in decisions if item["ignore"]}
         deep_records = []
+        deep_seen = set()
         for record, item in zip(records, decisions):
             if item["ignore"] or item.get("white_hits"):
                 continue
@@ -489,8 +493,23 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
                     continue
             # 高危也走深度研判,但只有模型基于真实源包判无害才允许忽略(见下)。
             deep_records.append(record)
+            deep_seen.add(str(record.get("EventId") or record.get("AlertClusterId") or ""))
         max_deep = int(alert_cfg.get("deep_triage_max", 120))
         deep_records = deep_records[:max_deep]
+
+        # 先消费重试队列:之前因模型连接超时降级的告警,网络好时在这里补判。
+        # 队列里的告警可能在当前时间窗外,需显式并入深判集合(去重)。
+        try:
+            import retry_queue
+            for qrec in retry_queue.queued_records(max_records=int(alert_cfg.get("retry_max_per_run", 60))):
+                qid = str(qrec.get("EventId") or qrec.get("AlertClusterId") or "")
+                if qid and qid not in deep_seen:
+                    deep_records.append(qrec)
+                    deep_seen.add(qid)
+                    queue_consumed += 1
+        except Exception:
+            retry_queue = None
+
         if deep_records:
             deep_judgements = deep_triage_records(config, deep_records, labels)
             high_ids = {item["event_id"] for item in decisions if item.get("level") == "High"}
@@ -510,6 +529,25 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
                         continue
                 deep_ignore_ids.append(event_id)
             ignore_ids = ignore_ids + deep_ignore_ids
+
+            # 重试队列维护:降级(连接超时)的入队等下次补判;判出真模型结果的出队。
+            try:
+                import retry_queue
+                rec_by_id = {str(r.get("EventId") or r.get("AlertClusterId") or ""): r for r in deep_records}
+                degraded, resolved = [], []
+                for eid, item in deep_judgements.items():
+                    src = str(item.get("研判来源", ""))
+                    if src.startswith("rule_fallback"):
+                        if eid in rec_by_id:
+                            degraded.append(rec_by_id[eid])
+                    else:
+                        resolved.append(eid)  # 判出真模型结果,出队
+                if not dry_run:
+                    queue_enqueued = retry_queue.enqueue(degraded, monitor.dt_text(monitor.now_local()))
+                    # 出队:判出真结果的 + 被规则/模型忽略掉的(已处置)
+                    queue_resolved = retry_queue.dequeue(set(resolved) | set(deep_ignore_ids))
+            except Exception:
+                pass
 
     white_records = [record_to_judge_row(record, labels, config) for record in records if white_hits(record, labels)]
     omit_actions = []
@@ -551,6 +589,9 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
         "deep_triaged": len(deep_judgements),
         "deep_ignored": len(set(deep_ignore_ids)),
         "deep_results": dict(Counter(item.get("模型研判", "") for item in deep_judgements.values())),
+        "retry_queue_consumed": queue_consumed,
+        "retry_queue_resolved": queue_resolved,
+        "retry_queue_enqueued": queue_enqueued,
         "omit_actions": omit_actions,
         "white_actions": white_actions,
     }
