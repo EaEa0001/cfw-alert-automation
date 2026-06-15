@@ -703,11 +703,20 @@ def main():
     judgements.update(monitor.llm_judge_rows(config, llm_rows))
 
     judged_rows = apply_judgements(rows, judgements)
-    ignore_ids = [
-        row["告警ID"]
-        for row in judged_rows
-        if row.get("模型研判") in IGNORE_RESULTS and row.get("告警ID")
-    ]
+    # 高危更严:仅当模型明确判"确认未成功/扫描探测"且置信非低才忽略;"未见成功证据"
+    # 这种存疑结论对高危保留人工。与小时任务 safe_hourly 的高危处置口径一致。
+    def _can_ignore(row):
+        result = row.get("模型研判")
+        if result not in IGNORE_RESULTS or not row.get("告警ID"):
+            return False
+        if row.get("告警等级") == "高危":
+            if result not in ("确认未成功", "扫描探测"):
+                return False
+            if row.get("模型置信度") == "低":
+                return False
+        return True
+
+    ignore_ids = [row["告警ID"] for row in judged_rows if _can_ignore(row)]
     candidates = white_rule_candidates(rows)
 
     REPORT_DIR.mkdir(exist_ok=True)
