@@ -192,6 +192,84 @@ def alerts(days=7, level=None, result=None, source=None, limit=300):
     return out[:limit]
 
 
+import ipaddress as _ipaddress
+
+
+def _is_public(ip):
+    try:
+        return _ipaddress.ip_address(str(ip).split("|")[0].strip()).is_global
+    except ValueError:
+        return False
+
+
+def attacker_rank(days=7, limit=12):
+    """攻击来源 TOP:按攻击IP聚合(手法数/告警数/方向/最高等级)。"""
+    rows = load_judgements(days)
+    agg = {}
+    for r in rows:
+        ip = str(r.get("攻击IP", "")).split("|")[0].strip()
+        if not ip:
+            continue
+        g = agg.setdefault(ip, {"ip": ip, "count": 0, "events": set(),
+                                "public": _is_public(ip), "high": 0, "success": 0})
+        g["count"] += 1
+        if r.get("事件名称"):
+            g["events"].add(r.get("事件名称"))
+        if r.get("告警等级") == "高危":
+            g["high"] += 1
+        if r.get("模型研判") == "确认成功":
+            g["success"] += 1
+    out = [{"ip": g["ip"], "count": g["count"], "techniques": len(g["events"]),
+            "public": g["public"], "high": g["high"], "success": g["success"]}
+           for g in agg.values()]
+    out.sort(key=lambda x: (x["success"], x["high"], x["techniques"], x["count"]), reverse=True)
+    return out[:limit]
+
+
+def asset_rank(days=7, limit=12):
+    """被攻击资产 TOP:按目标IP聚合(被打次数/攻击者数/最高等级)。"""
+    rows = load_judgements(days)
+    agg = {}
+    for r in rows:
+        for dst in str(r.get("目标IP", "")).split("|"):
+            dst = dst.strip()
+            if not dst:
+                continue
+            g = agg.setdefault(dst, {"dst": dst, "count": 0, "attackers": set(), "high": 0})
+            g["count"] += 1
+            src = str(r.get("攻击IP", "")).split("|")[0].strip()
+            if src:
+                g["attackers"].add(src)
+            if r.get("告警等级") == "高危":
+                g["high"] += 1
+    out = [{"dst": g["dst"], "count": g["count"], "attackers": len(g["attackers"]), "high": g["high"]}
+           for g in agg.values()]
+    out.sort(key=lambda x: (x["high"], x["count"]), reverse=True)
+    return out[:limit]
+
+
+def realtime_attention(days=2, limit=30):
+    """需重点关注的实时列表:确认成功/需人工复核/高危。"""
+    rows = load_judgements(days)
+    out = []
+    for r in rows:
+        if r.get("模型研判") in ("确认成功", "需人工复核") or r.get("告警等级") == "高危":
+            out.append({
+                "time": r.get("告警时间", ""),
+                "level": r.get("告警等级", ""),
+                "event": r.get("事件名称", ""),
+                "src": r.get("攻击IP", ""),
+                "dst": r.get("目标IP", ""),
+                "result": r.get("模型研判", ""),
+                "reason": r.get("研判理由", ""),
+                "public": _is_public(str(r.get("攻击IP", "")).split("|")[0].strip()),
+            })
+    prio = {"确认成功": 0, "需人工复核": 1}
+    out.sort(key=lambda x: (prio.get(x["result"], 5), x["time"]), reverse=False)
+    out.sort(key=lambda x: (x["result"] == "确认成功", x["level"] == "高危"), reverse=True)
+    return out[:limit]
+
+
 def health(days=7):
     """健康面板:LLM 错误/降级、处置失败、源包命中率、Agent 占比、企微发送。"""
     cutoff = datetime.now() - timedelta(days=days)
@@ -219,6 +297,7 @@ def health(days=7):
     rows = load_judgements(days)
     with_evidence = sum(1 for r in rows if r.get("证据来源") in ("主动拉取", "本地缓存"))
     agent_count = sum(1 for r in rows if r.get("研判来源") == "codex_agent")
+    degraded = sum(1 for r in rows if str(r.get("研判来源", "")).startswith("rule_fallback"))
     return {
         "errors_total": sum(err_by_type.values()),
         "errors_by_type": dict(err_by_type),
@@ -227,6 +306,8 @@ def health(days=7):
         "dispose_failed": dispose_failed,
         "evidence_hit_rate": round(with_evidence / len(rows) * 100, 1) if rows else 0,
         "evidence_hit": with_evidence,
+        "degraded": degraded,
+        "degraded_rate": round(degraded / len(rows) * 100, 1) if rows else 0,
         "agent_count": agent_count,
         "total": len(rows),
     }

@@ -52,6 +52,26 @@ def api_alerts():
     ))
 
 
+@app.route("/api/attacker_rank")
+def api_attacker_rank():
+    return jsonify(stats.attacker_rank(_days()))
+
+
+@app.route("/api/asset_rank")
+def api_asset_rank():
+    return jsonify(stats.asset_rank(_days()))
+
+
+@app.route("/api/realtime")
+def api_realtime():
+    return jsonify(stats.realtime_attention(_days()))
+
+
+@app.route("/screen")
+def screen():
+    return SCREEN_PAGE
+
+
 def _days():
     try:
         return max(1, min(60, int(request.args.get("days", 7))))
@@ -338,6 +358,151 @@ function loadAll(){
 }
 loadAll();
 setInterval(loadAll, 120000); // 2 分钟自动刷新
+</script>
+</body>
+</html>"""
+
+
+SCREEN_PAGE = r"""<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>云防火墙安全态势大屏</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root{--bg:#070b14;--panel:#0e1726;--line:#1b2942;--fg:#e8f0fb;--mut:#6b7d99;
+        --hi:#ff5470;--ok:#28d49a;--warn:#ffb547;--acc:#3da9fc;--acc2:#9d7bff;}
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:radial-gradient(circle at 50% -20%,#10203a,#070b14 60%);color:var(--fg);
+       font:14px/1.5 "Segoe UI","Microsoft YaHei",sans-serif;height:100vh;overflow:hidden;}
+  .top{display:flex;align-items:center;justify-content:space-between;padding:14px 28px;
+       border-bottom:1px solid var(--line);background:rgba(13,23,42,.6);}
+  .top h1{font-size:22px;letter-spacing:2px;font-weight:700;}
+  .top h1 .dot{color:var(--ok);font-size:13px;}
+  .top .clock{font-size:18px;color:var(--acc);font-variant-numeric:tabular-nums;}
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);grid-auto-rows:minmax(0,1fr);
+        gap:14px;padding:14px 20px;height:calc(100vh - 60px);}
+  .kpi{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+       padding:16px 20px;display:flex;flex-direction:column;justify-content:center;}
+  .kpi .label{color:var(--mut);font-size:13px;letter-spacing:1px;}
+  .kpi .num{font-size:42px;font-weight:800;line-height:1.1;margin-top:6px;}
+  .kpi .sub{color:var(--mut);font-size:12px;margin-top:4px;}
+  .num.ok{color:var(--ok);} .num.hi{color:var(--hi);} .num.warn{color:var(--warn);} .num.acc{color:var(--acc);}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;
+         display:flex;flex-direction:column;min-height:0;}
+  .panel h2{font-size:13px;color:var(--mut);letter-spacing:1px;margin-bottom:10px;font-weight:600;flex:0 0 auto;}
+  .panel .body{flex:1 1 auto;min-height:0;position:relative;overflow:auto;}
+  .span2{grid-column:span 2;} .span4{grid-column:span 4;} .row2{grid-row:span 2;}
+  table{width:100%;border-collapse:collapse;font-size:13px;}
+  td,th{padding:5px 8px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap;
+        overflow:hidden;text-overflow:ellipsis;max-width:280px;}
+  th{color:var(--mut);font-weight:600;position:sticky;top:0;background:var(--panel);}
+  .tag{padding:1px 8px;border-radius:10px;font-size:11px;}
+  .t-高危{background:#3a1622;color:var(--hi);} .t-中危{background:#3a3016;color:var(--warn);}
+  .r-确认成功{color:var(--hi);font-weight:700;} .r-需人工复核{color:var(--warn);}
+  .pub{color:var(--hi);} .pri{color:var(--acc);}
+  .bar{height:7px;border-radius:4px;background:linear-gradient(90deg,var(--acc),var(--acc2));}
+  .blink{animation:bk 1.4s infinite;} @keyframes bk{50%{opacity:.4;}}
+  .updated{color:var(--mut);font-size:12px;}
+</style>
+</head>
+<body>
+<div class="top">
+  <h1>🛡️ 云防火墙安全态势大屏 <span class="dot">● 实时</span></h1>
+  <div><span class="clock" id="clock"></span>　<span class="updated" id="upd"></span></div>
+</div>
+<div class="grid">
+  <div class="kpi"><div class="label">今日告警总量</div><div class="num acc" id="k_total">-</div><div class="sub" id="k_total_s"></div></div>
+  <div class="kpi"><div class="label">自动处置</div><div class="num ok" id="k_auto">-</div><div class="sub" id="k_auto_s"></div></div>
+  <div class="kpi"><div class="label">需人工复核</div><div class="num warn" id="k_manual">-</div><div class="sub">待处理</div></div>
+  <div class="kpi"><div class="label">确认成功</div><div class="num hi" id="k_success">-</div><div class="sub">真实得手</div></div>
+
+  <div class="panel span2 row2"><h2>📈 每日告警趋势</h2><div class="body"><canvas id="trend"></canvas></div></div>
+  <div class="panel row2"><h2>🍩 研判结果分布</h2><div class="body"><canvas id="result"></canvas></div></div>
+  <div class="panel row2"><h2>🩺 系统健康</h2><div class="body"><table id="health"></table></div></div>
+
+  <div class="panel"><h2>🌍 攻击来源 TOP</h2><div class="body"><table id="attackers"></table></div></div>
+  <div class="panel"><h2>🎯 被攻击资产 TOP</h2><div class="body"><table id="assets"></table></div></div>
+  <div class="panel span2 row2"><h2>🔴 需重点关注(实时)</h2><div class="body"><table id="attention"></table></div></div>
+  <div class="panel"><h2>🟡 研判来源</h2><div class="body"><table id="sources"></table></div></div>
+  <div class="panel"><h2>🪙 Token 用量</h2><div class="body"><table id="tokens"></table></div></div>
+</div>
+<script>
+let trendC,resultC;
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const fmt=n=>(n||0).toLocaleString();
+async function J(p){const r=await fetch(p+'?days=1');return r.json();}
+async function J7(p){const r=await fetch(p+'?days=7');return r.json();}
+
+function tick(){$('#clock').textContent=new Date().toLocaleString('zh-CN');}
+setInterval(tick,1000);tick();
+
+async function load(){
+  const [ov,tr,he,atk,ast,att]=await Promise.all([
+    J('/api/overview'),J7('/api/trend'),J('/api/health'),
+    J('/api/attacker_rank'),J('/api/asset_rank'),J('/api/realtime')]);
+  // KPI
+  $('#k_total').textContent=fmt(ov.total);
+  $('#k_total_s').textContent='忽略率 '+ov.ignore_rate+'%';
+  $('#k_auto').textContent=fmt(ov.auto_ignored);
+  $('#k_auto_s').textContent='保留 '+fmt(ov.retained);
+  $('#k_manual').textContent=fmt(ov.results['需人工复核']||0);
+  const sc=ov.results['确认成功']||0;
+  $('#k_success').textContent=fmt(sc);
+  $('#k_success').classList.toggle('blink',sc>0);
+
+  // 趋势
+  if(trendC)trendC.destroy();
+  trendC=new Chart($('#trend'),{data:{labels:tr.days,datasets:[
+    {type:'bar',label:'告警',data:tr.total,backgroundColor:'#3da9fc',borderRadius:4,yAxisID:'y'},
+    {type:'line',label:'Token',data:tr.tokens,borderColor:'#ffb547',tension:.35,yAxisID:'y1',pointRadius:2}]},
+    options:{maintainAspectRatio:false,plugins:{legend:{labels:{color:'#e8f0fb'}}},
+    scales:{y:{ticks:{color:'#6b7d99'},grid:{color:'#1b2942'}},y1:{position:'right',ticks:{color:'#6b7d99'},grid:{display:false}},x:{ticks:{color:'#6b7d99'},grid:{display:false}}}}});
+
+  // 研判分布
+  const labels=Object.keys(ov.results),data=Object.values(ov.results);
+  const colors=labels.map(l=>l==='确认成功'?'#ff5470':l==='需人工复核'?'#ffb547':l==='扫描探测'?'#6b7d99':'#3da9fc');
+  if(resultC)resultC.destroy();
+  resultC=new Chart($('#result'),{type:'doughnut',data:{labels,datasets:[{data,backgroundColor:colors,borderColor:'#0e1726',borderWidth:2}]},
+    options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom',labels:{color:'#e8f0fb',boxWidth:12,font:{size:11}}}}}});
+
+  // 健康
+  $('#health').innerHTML=`
+    <tr><td>源包命中率</td><td class="pri">${he.evidence_hit_rate}%</td></tr>
+    <tr><td>降级率</td><td class="${he.degraded_rate>30?'pub':(he.degraded_rate>10?'warn':'')}">${he.degraded_rate}%　<span class="updated">(${he.degraded}/${he.total})</span></td></tr>
+    <tr><td>处置忽略累计</td><td>${fmt(he.dispose_ignored)}</td></tr>
+    <tr><td>处置失败</td><td class="${he.dispose_failed?'pub':''}">${he.dispose_failed}</td></tr>
+    <tr><td>LLM错误/降级</td><td class="${he.errors_total?'warn':''}">${he.errors_total}</td></tr>
+    <tr><td>Agent 研判</td><td>${he.agent_count}</td></tr>`;
+
+  // 攻击来源
+  $('#attackers').innerHTML='<tr><th>来源IP</th><th>手法</th><th>次数</th><th>高危</th></tr>'+
+    atk.map(a=>`<tr><td class="${a.public?'pub':'pri'}">${esc(a.ip)}${a.public?' 🌐':' 🏠'}</td><td>${a.techniques}</td><td>${a.count}</td><td class="${a.high?'pub':''}">${a.high||''}</td></tr>`).join('');
+
+  // 被攻击资产
+  $('#assets').innerHTML='<tr><th>目标</th><th>被打</th><th>攻击者</th><th>高危</th></tr>'+
+    ast.map(a=>`<tr><td>${esc(a.dst)}</td><td>${a.count}</td><td>${a.attackers}</td><td class="${a.high?'pub':''}">${a.high||''}</td></tr>`).join('');
+
+  // 需重点关注
+  $('#attention').innerHTML='<tr><th>时间</th><th>等级</th><th>事件</th><th>来源→目标</th><th>研判</th></tr>'+
+    (att.length?att.map(a=>`<tr>
+      <td>${esc((a.time||'').slice(5,16))}</td>
+      <td><span class="tag t-${a.level}">${a.level||''}</span></td>
+      <td>${esc(a.event)}</td>
+      <td class="${a.public?'pub':'pri'}">${esc((a.src||'').slice(0,24))} → ${esc((a.dst||'').slice(0,20))}</td>
+      <td class="r-${a.result}">${a.result||''}</td></tr>`).join('')
+     :'<tr><td colspan="5" style="color:var(--ok);padding:20px">✅ 当前无需重点关注的告警</td></tr>');
+
+  // 研判来源 + Token
+  $('#sources').innerHTML=Object.entries(ov.sources).map(([k,v])=>`<tr><td>${esc(k)}</td><td>${v}</td></tr>`).join('');
+  const t=ov.tokens;
+  $('#tokens').innerHTML=`<tr><td>输入</td><td>${fmt(t.input)}</td></tr><tr><td>输出</td><td>${fmt(t.output)}</td></tr><tr><td>推理</td><td>${fmt(t.reasoning)}</td></tr><tr><td>合计</td><td class="pri">${fmt(t.total)}</td></tr>`;
+
+  $('#upd').textContent='更新 '+new Date().toLocaleTimeString();
+}
+load();setInterval(load,30000);
 </script>
 </body>
 </html>"""
