@@ -44,6 +44,25 @@ def _business_ok(evidence_text):
     return bool(BUSINESS_OK.search(str(evidence_text or "")))
 
 
+def _response_side(row):
+    """只取源包证据里响应侧字段(resp/resp_body/resp_mark/cmd)+关键证据,
+    排除请求侧 req(避免把攻击'尝试'误当成'得手')。"""
+    parts = [str(row.get("关键证据", ""))]
+    raw = row.get("源包证据", "")
+    if isinstance(raw, str) and raw.strip().startswith("{"):
+        try:
+            ev = json.loads(raw)
+            for k in ("resp", "resp_body", "resp_mark", "cmd", "ar"):
+                if ev.get(k):
+                    parts.append(str(ev[k]))
+            return " ".join(parts)
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    # 解析不了就保守用整体(宁可多报落地也不漏)
+    parts.append(str(raw))
+    return " ".join(parts)
+
+
 def evaluate(days=2):
     rows = stats.load_judgements(days)
     n = len(rows)
@@ -97,8 +116,11 @@ def evaluate(days=2):
             if _has_landed(evidence_blob) or "成功" in str(r.get("源包证据", "")):
                 m2_grounded.append(r)
 
-        # M5 高危召回:有明确落地信号的,不能被自动忽略
-        if _has_landed(evidence_blob):
+        # M5 高危召回:只看"响应侧/落地侧"的落地信号(命令回显、木马通信、响应体敏感数据)。
+        # 请求里带 webshell/注入串只是"尝试",不算得手,不应计入(否则误把尝试当落地)。
+        resp_blob = _response_side(r)
+        landed = _has_landed(resp_blob) or "木马通信" in str(r.get("事件名称", "")) or "njRAT" in str(r.get("事件名称", ""))
+        if landed:
             m5_landed_alerts.append(r)
             if result not in ignore_results:
                 m5_retained.append(r)
