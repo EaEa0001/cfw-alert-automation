@@ -447,6 +447,12 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
     deep_judgements = {}
     deep_ignore_ids = []
     if deep_enabled:
+        # 深度研判很贵(每条抓源包+两遍LLM+高危Agent),小时任务有超时限制,
+        # 只对最近 deep_lookback_hours 的告警做深判;更早的积压交给日报(无紧超时)。
+        # 规则层(白名单/4xx/扫描/Shodan探针)仍扫全窗口,所以积压的明显误报照样被清。
+        deep_lookback = int(alert_cfg.get("deep_lookback_hours", 2))
+        end_dt = parse_local_time(end) if not isinstance(end, datetime) else end
+        deep_cutoff = end_dt - timedelta(hours=deep_lookback) if end_dt else None
         decided_ids = {item["event_id"] for item in decisions if item["ignore"]}
         deep_records = []
         for record, item in zip(records, decisions):
@@ -454,8 +460,12 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
                 continue
             if item.get("attack_result") == "1":
                 continue  # 云端标记成功一律保留,不自动处置
-            # 高危原先一律保留导致内网业务误报永远清不掉;现在也让它走深度研判,
-            # 但只有模型(基于真实源包)判为无害时才允许忽略(见下方 deep_ignore 逻辑)。
+            # 只深判最近窗口内的,避免小时任务因积压太多深判超时被 kill
+            if deep_cutoff:
+                rec_dt = parse_local_time(record.get("EndTime"))
+                if rec_dt and rec_dt < deep_cutoff:
+                    continue
+            # 高危也走深度研判,但只有模型基于真实源包判无害才允许忽略(见下)。
             deep_records.append(record)
         max_deep = int(alert_cfg.get("deep_triage_max", 120))
         deep_records = deep_records[:max_deep]
