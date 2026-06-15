@@ -408,18 +408,31 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
         for record, item in zip(records, decisions):
             if item["ignore"] or item.get("white_hits"):
                 continue
-            if item.get("attack_result") == "1" or item.get("level") == "High":
-                continue  # 高危/云端成功一律保留,不自动处置
+            if item.get("attack_result") == "1":
+                continue  # 云端标记成功一律保留,不自动处置
+            # 高危原先一律保留导致内网业务误报永远清不掉;现在也让它走深度研判,
+            # 但只有模型(基于真实源包)判为无害时才允许忽略(见下方 deep_ignore 逻辑)。
             deep_records.append(record)
         max_deep = int(alert_cfg.get("deep_triage_max", 120))
         deep_records = deep_records[:max_deep]
         if deep_records:
             deep_judgements = deep_triage_records(config, deep_records, labels)
-            deep_ignore_ids = [
-                event_id
-                for event_id, item in deep_judgements.items()
-                if item.get("模型研判") in IGNORE_RESULTS and event_id and event_id not in decided_ids
-            ]
+            high_ids = {item["event_id"] for item in decisions if item.get("level") == "High"}
+            deep_ignore_ids = []
+            for event_id, item in deep_judgements.items():
+                if not event_id or event_id in decided_ids:
+                    continue
+                result = item.get("模型研判")
+                if result not in IGNORE_RESULTS:
+                    continue
+                # 高危更严:必须模型明确判"确认未成功/扫描探测"(明确无害),
+                # 且置信不为低,才允许忽略;"未见成功证据"这种存疑结论不忽略高危,留人工。
+                if event_id in high_ids:
+                    if result not in ("确认未成功", "扫描探测"):
+                        continue
+                    if item.get("模型置信度") == "低":
+                        continue
+                deep_ignore_ids.append(event_id)
             ignore_ids = ignore_ids + deep_ignore_ids
 
     white_records = [record_to_judge_row(record, labels, config) for record in records if white_hits(record, labels)]
