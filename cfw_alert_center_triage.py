@@ -312,6 +312,31 @@ def record_source_failure_evidence(record):
     }
 
 
+# Shodan malware-hunter 的 njRAT 探针使用一组固定内置数据(从 2019 年起全网可见),
+# 这些不是任何真实资产。载荷里同时出现这几项即可确定是 Shodan njRAT 探测,而非感染。
+# 参考:malware-hunter.census.shodan.io 固定 njRAT 上线包。
+SHODAN_NJRAT_MARKERS = ("145.ll", "WIN-JNAPIER0859", "HacKed_", "clienta.exe", "192.168.92.222")
+
+
+def shodan_njrat_probe_text(text):
+    """文本中命中的 Shodan njRAT 探针特征数(>=2 即高度确定为探针)。"""
+    text = str(text or "")
+    return sum(1 for m in SHODAN_NJRAT_MARKERS if m in text)
+
+
+def is_shodan_njrat_probe(record, extra_text=""):
+    """判断一条告警是否为 Shodan njRAT 探针误报(基于固定内置数据特征)。"""
+    name = str(record.get("EventName") or "")
+    if "njRAT" not in name and "njrat" not in name.lower():
+        return False
+    blob = " ".join([
+        str(record.get("Payload") or ""),
+        json.dumps(record.get("source_evidence") or {}, ensure_ascii=False) if isinstance(record.get("source_evidence"), dict) else "",
+        str(extra_text or ""),
+    ])
+    return shodan_njrat_probe_text(blob) >= 2
+
+
 def safe_hourly_decision(record, labels):
     event_id = str(record.get("EventId") or record.get("AlertClusterId") or "")
     name = str(record.get("EventName") or "")
@@ -330,6 +355,14 @@ def safe_hourly_decision(record, labels):
         "reason": "",
         "white_hits": hits,
     }
+
+    # 第 -1 层(确定性误报):Shodan njRAT 探针。即使云端标"成功"/高危,只要载荷
+    # 命中 Shodan 固定内置数据(WIN-JNAPIER0859/HacKed_/145.ll 等)即确定为外部扫描
+    # 探测,不是本机感染,直接判扫描探测忽略。(经上机排查 + 多方研判确认)
+    if is_shodan_njrat_probe(record):
+        decision["ignore"] = True
+        decision["reason"] = "Shodan njRAT 探针(固定内置数据,非本机感染)"
+        return decision
 
     # 三层漏斗:
     #   第0层 确定性 — 云端成功 / 高危 / 白名单,直接定;
@@ -394,6 +427,17 @@ def deep_triage_records(config, records, labels):
 def safe_hourly_dispose(config, start, end, dry_run=False):
     records, query = fetch_unhandled_alert_center_range(config, start, end)
     labels = whitelist_labels(config)
+    # njRAT 等 RAT 告警的探针特征藏在源包里,先给这类记录补拉源包,
+    # 以便 safe_hourly_decision 能确定性识别 Shodan 探针误报。
+    for record in records:
+        nm = str(record.get("EventName") or "")
+        if ("njRAT" in nm or "njrat" in nm.lower()) and not record.get("source_evidence"):
+            try:
+                ev = monitor.fetch_source_evidence_for_record(config, record)
+                if ev:
+                    record["source_evidence"] = ev
+            except Exception:
+                pass
     decisions = [safe_hourly_decision(record, labels) for record in records]
     ignore_ids = [item["event_id"] for item in decisions if item["ignore"] and item["event_id"]]
 
