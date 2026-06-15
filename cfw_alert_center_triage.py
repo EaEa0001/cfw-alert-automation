@@ -741,9 +741,21 @@ def main():
 
     white_actions = []
     omit_actions = []
+    wechat_push = {"sent": False, "reason": "dry_run" if args.dry_run else "skipped"}
     if not args.dry_run:
         white_actions = allow_scanner_ips(config, rows)
         omit_actions = omit_alert_center_events(config, ignore_ids, int((config.get("llm") or {}).get("auto_dispose", {}).get("batch_size", 50)))
+        # 微信专推"需人工复核"+"确认成功"(需你处理的 + 真出事的);企微汇总不受影响
+        manual_results = {"需人工复核", "确认成功"}
+        manual_rows = [row for row in judged_rows if row.get("模型研判") in manual_results]
+        if manual_rows:
+            try:
+                import weclaw_notify
+                wechat_push = weclaw_notify.push_manual_review(config, manual_rows)
+            except Exception as exc:
+                wechat_push = {"sent": False, "error": str(exc)[:200]}
+        else:
+            wechat_push = {"sent": False, "reason": "no_manual_items"}
 
     summary = {
         "mode": "alert_center_triage",
@@ -758,6 +770,7 @@ def main():
         "ignore_event_ids": len(set(ignore_ids)),
         "white_actions": white_actions,
         "omit_actions": omit_actions,
+        "wechat_push": wechat_push,
         "judgement_csv": str(csv_path),
         "judgement_jsonl": str(jsonl_path),
     }

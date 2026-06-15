@@ -71,5 +71,10 @@
       "ids_white_rule_type": "srcdst",
       "ids_white_fw_type": 7
     }
+  },
+  "weclaw": {
+    "enabled": false,
+    "max_items": 10,
+    "to_user_id": ""
   }
 }
