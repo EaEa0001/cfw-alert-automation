@@ -207,62 +207,121 @@ def disposition_failures(disposition):
     return failures
 
 
+# 把内部研判状态翻译成运维能行动的人话 + 优先级
+_REASON_PLAIN = [
+    ("Shodan", ("背景探测(Shodan)", 9)),
+    ("白名单", ("白名单扫描源", 9)),
+    ("扫描器特征", ("扫描器探测,未成功", 8)),
+    ("响应为失败码", ("攻击已失败(响应失败码)", 8)),
+    ("云端判失败", ("攻击疑似失败,低优先级", 7)),
+    ("攻击结果未知", ("利用尝试,未确认是否得手,建议查日志", 4)),
+    ("高危告警保留", ("高危事件,需人工确认", 2)),
+    ("云端标记攻击成功", ("⚠️云端标记成功,立即核查", 0)),
+]
+# 扫描/探测类事件名关键词(归入"背景噪声"汇总,不逐条刷屏)
+_NOISE_KEYWORDS = ("扫描", "探测", "Censys", "masscan", "nmap", "zgrab", "Shodan", "信息泄露")
+
+
+def _plain_reason(reason):
+    for key, (plain, prio) in _REASON_PLAIN:
+        if key in str(reason or ""):
+            return plain, prio
+    return str(reason or "需复核"), 5
+
+
+def _is_noise_event(name):
+    return any(k in str(name or "") for k in _NOISE_KEYWORDS)
+
+
 def build_hourly_wecom_message(start_text, end_text, total, rows, judged_rows, disposition, alert_center):
-    levels = Counter(row.get("告警等级", "") for row in rows if row.get("告警等级"))
-    judgements = Counter(row.get("模型研判", "") for row in judged_rows if row.get("模型研判"))
-    event_names = Counter(row.get("事件名称", "") for row in rows if row.get("事件名称"))
-    review_rows = [
-        row
-        for row in judged_rows
-        if row.get("模型研判") in ("确认成功", "需人工复核")
-        or row.get("告警等级") in ("严重", "高危")
+    ac = alert_center or {}
+    window = f"{start_text[11:16]}-{end_text[11:16]}"
+    retained_items = ac.get("retained_items") or []
+
+    # 原始流量需关注(确认成功/需人工/高危)
+    flow_review = [
+        row for row in judged_rows
+        if row.get("模型研判") in ("确认成功", "需人工复核") or row.get("告警等级") in ("严重", "高危")
     ]
-    review_names = Counter(row.get("事件名称", "") for row in review_rows if row.get("事件名称"))
-    fallback_count = sum(
-        1 for row in judged_rows if str(row.get("研判来源", "")).startswith("rule_fallback")
+
+    # 告警中心保留项:分流为「真威胁(需关注)」和「背景噪声(只计数)」
+    threats, noise = [], []
+    for item in retained_items:
+        if _is_noise_event(item.get("event_name")):
+            noise.append(item)
+        else:
+            threats.append(item)
+    # 真威胁按优先级排序(理由翻译里带优先级)
+    for it in threats:
+        it["_plain"], it["_prio"] = _plain_reason(it.get("reason"))
+    threats.sort(key=lambda it: (it["_prio"], not it.get("src_public", False)))
+
+    fallback_count = sum(1 for row in judged_rows if str(row.get("研判来源", "")).startswith("rule_fallback"))
+    has_critical = ac.get("retained_success", 0) or any(it["_prio"] <= 2 for it in threats) or flow_review
+
+    lines = [f"## 🛡️ 云防火墙告警简报  {window}"]
+
+    # 一行总览
+    lines.append(
+        f"> 告警中心 检查 **{ac.get('active_before', 0)}** / 自动忽略 **{ac.get('ignored_confirmed', 0)}** / 留存 **{ac.get('retained', 0)}**"
+        + (f"　原始流量 **{len(rows)}**" if rows else "")
     )
-    retained_events = Counter(alert_center.get("retained_events") or {})
-    lines = [
-        "## 云防火墙每小时告警处理",
-        f"> 时间窗：{start_text} 至 {end_text}",
-        f"- 原始流量：日志 **{total}**，研判 **{len(rows)}**，忽略 **{disposition.get('ignored_alerts', 0)}**",
-        f"- 原始流量等级：{counter_text(levels, ['严重', '高危', '中危', '低危', '提示'])}",
-        f"- 原始流量研判：{counter_text(judgements, ['确认成功', '需人工复核', '确认未成功', '未见成功证据', '扫描探测'])}",
-        f"- 告警中心：检查 **{alert_center.get('active_before', 0)}**，忽略 **{alert_center.get('ignored_confirmed', 0)}**，保留 **{alert_center.get('retained', 0)}**",
-        f"- 告警中心保留：高危 **{alert_center.get('retained_high', 0)}**，攻击成功 **{alert_center.get('retained_success', 0)}**",
-        f"- 告警中心主要保留事件：{counter_text(retained_events, limit=5)}",
-        f"- 处置失败：原始流量 **{disposition_failures(disposition)}**，告警中心 **{disposition_failures({'actions': alert_center.get('omit_actions', []) + alert_center.get('white_actions', [])})}**",
-    ]
-    retained_items = alert_center.get("retained_items") or []
-    retained_count = int(alert_center.get("retained", len(retained_items)) or 0)
-    total_review = len(review_rows) + retained_count
-    if total_review:
-        lines.append(f"- <font color=\"warning\">需要关注：原始流量 **{len(review_rows)}** 条，告警中心 **{retained_count}** 条</font>")
-        priority = {"确认成功": 0, "严重": 1, "高危": 2, "需人工复核": 3}
-        review_rows.sort(
-            key=lambda row: (
-                priority.get(row.get("模型研判"), priority.get(row.get("告警等级"), 9)),
-                row.get("告警时间", ""),
-            )
-        )
-        for row in review_rows[:5]:
-            target = row.get("目标资产") or row.get("目标IP") or "未知目标"
+
+    # 按攻击者(源IP集合)聚合,同一组源IP的多手法合并成一条,避免刷屏
+    by_attacker = {}
+    for it in threats:
+        key = "|".join(sorted(it.get("src_ips") or []) or ["未知"])
+        g = by_attacker.setdefault(key, {
+            "src": key, "events": set(), "assets": set(), "dsts": set(),
+            "direction": it.get("direction") or "", "prio": it["_prio"], "plain": it["_plain"],
+        })
+        g["events"].add(it.get("event_name") or "未知事件")
+        g["assets"].update(it.get("asset_names") or [])
+        g["dsts"].update(it.get("dst_ips") or [])
+        g["prio"] = min(g["prio"], it["_prio"])
+    attackers = sorted(by_attacker.values(), key=lambda g: (g["prio"], len(g["events"]) * -1))
+
+    if attackers or flow_review:
+        lines.append(f"\n**🔴 需重点关注（{len(attackers)} 个来源 / {len(flow_review)} 原始流量）**")
+        for g in attackers[:8]:
+            evs = sorted(g["events"])
+            ev_show = evs[0] if len(evs) == 1 else f"{evs[0]} 等 {len(evs)} 种手法"
+            dst = "|".join(sorted(g["dsts"])[:3]) or "未知"
+            asset = "、".join(sorted(g["assets"])[:3])
+            dst_show = f"{dst}（{asset}）" if asset else dst
             lines.append(
-                f"> {row.get('模型研判') or row.get('告警等级')} | "
-                f"{row.get('事件名称') or '未知事件'} | "
-                f"{row.get('攻击IP') or '未知来源'} -> {target}"
+                f"> [{g['direction']}] **{ev_show}**\n"
+                f"> 　{g['src']} → {dst_show}\n"
+                f"> 　{g['plain']}"
             )
-        for item in retained_items[:5]:
-            src = "|".join(item.get("src_ips") or []) or "未知来源"
-            dst = "|".join(item.get("dst_ips") or []) or "未知目标"
+        for row in flow_review[:3]:
+            target = row.get("目标资产") or row.get("目标IP") or "未知"
             lines.append(
-                f"> 告警中心保留 | {item.get('event_name') or '未知事件'} | "
-                f"{src} -> {dst} | {item.get('reason') or '需复核'}"
+                f"> [原始流量] **{row.get('事件名称') or '未知事件'}**\n"
+                f"> 　{row.get('攻击IP') or '未知'} → {target}　{row.get('模型研判') or row.get('告警等级')}"
             )
-    else:
-        lines.append("- <font color=\"info\">本小时两个数据源均无需要关注的告警</font>")
+
+    # 🟡 自动已处理 / 背景噪声(只汇总计数,不刷屏)
+    auto_handled = int(ac.get("ignored_confirmed", 0) or 0)
+    if auto_handled or noise:
+        parts = []
+        if auto_handled:
+            parts.append(f"自动忽略 **{auto_handled}**")
+        if noise:
+            noise_src = len({"|".join(n.get("src_ips") or []) for n in noise})
+            parts.append(f"背景扫描噪声 **{len(noise)}** 条（{noise_src} 个源,已留存待日报清理）")
+        lines.append(f"\n**🟡 已处理 / 噪声**：" + "　".join(parts))
+
+    # 异常提示
+    fails = disposition_failures(disposition) + disposition_failures(
+        {"actions": (ac.get("omit_actions") or []) + (ac.get("white_actions") or [])})
+    if fails:
+        lines.append(f"\n<font color=\"warning\">⚠️ 处置失败 **{fails}** 条,需检查</font>")
     if fallback_count:
-        lines.append(f"- <font color=\"warning\">模型降级：**{fallback_count}** 条使用本地规则，结果需注意</font>")
+        lines.append(f"<font color=\"warning\">⚠️ 模型降级 **{fallback_count}** 条(连接异常,用规则兜底)</font>")
+    if not (threats or flow_review):
+        lines.append("\n<font color=\"info\">✅ 本小时无需重点关注的告警</font>")
+
     return "\n".join(lines)
 
 
@@ -844,19 +903,26 @@ def collect(args):
     if notify_cfg.get("hourly_enabled", True) and (
         hourly_rows or notify_cfg.get("notify_on_empty", True)
     ) and not getattr(args, "skip_triage", False):
-        result["wecom_notify"] = send_wecom_markdown(
-            config,
-            build_hourly_wecom_message(
-                start_text,
-                end_text,
-                total,
-                hourly_rows,
-                disposed_rows,
-                disposition,
-                alert_center_disposition,
-            ),
-            "hourly",
+        hourly_msg = build_hourly_wecom_message(
+            start_text, end_text, total, hourly_rows, disposed_rows,
+            disposition, alert_center_disposition,
         )
+        result["wecom_notify"] = send_wecom_markdown(config, hourly_msg, "hourly")
+        # 仅当本小时有真高危(确认成功 / 高危留存 / 原始流量需关注)才 @所有人,
+        # 普通噪声小时静默播报,不打扰。
+        ac = alert_center_disposition or {}
+        flow_critical = any(
+            r.get("模型研判") in ("确认成功", "需人工复核") or r.get("告警等级") in ("严重", "高危")
+            for r in disposed_rows
+        )
+        if notify_cfg.get("hourly_at_all_on_critical", True) and (
+            ac.get("retained_success", 0) or ac.get("retained_high", 0) or flow_critical
+        ):
+            send_wecom_text(
+                config,
+                f"⚠️ 本小时有需重点关注的告警(高危留存 {ac.get('retained_high', 0)}),详见上方简报,请及时处理。",
+                "hourly_at", mentioned_list=["@all"],
+            )
     print(json.dumps(result, ensure_ascii=False))
 
 

@@ -93,6 +93,14 @@ def compact_assets(items, limit=6):
     return "|".join(output)
 
 
+def _is_public_ip(ip):
+    import ipaddress
+    try:
+        return ipaddress.ip_address(str(ip)).is_global
+    except ValueError:
+        return False
+
+
 def evidence_hit_text(evidence):
     """源包命中摘要:有几条 + 是否带响应/命令成功线索,方便人工一眼看出。"""
     if not isinstance(evidence, dict) or not evidence:
@@ -343,13 +351,27 @@ def safe_hourly_decision(record, labels):
     level = str(record.get("Level") or "")
     attack_result = str(record.get("AttackResult", ""))
     hits = white_hits(record, labels)
+    src_ips = [str(ip) for ip in (record.get("SrcIpList") or [])]
+    dst_ips = [str(ip) for ip in (record.get("DstIpList") or [])]
+    # 资产名(目标 CVM/POD 名),方便人工一眼知道打的是哪台
+    asset_names = []
+    for inst in (record.get("DstInstanceList") or []):
+        if isinstance(inst, dict) and inst.get("InstanceName"):
+            asset_names.append(str(inst["InstanceName"]))
+    # 攻击方向:公网→内网 / 内网→内网(内网横向更值得警惕)
+    src_public = any(_is_public_ip(ip) for ip in src_ips)
+    direction = "公网→内网" if src_public else "内网→内网"
     decision = {
         "event_id": event_id,
         "event_name": name,
         "level": level,
         "attack_result": attack_result,
-        "src_ips": [str(ip) for ip in (record.get("SrcIpList") or [])],
-        "dst_ips": [str(ip) for ip in (record.get("DstIpList") or [])],
+        "src_ips": src_ips,
+        "dst_ips": dst_ips,
+        "asset_names": asset_names,
+        "direction": direction,
+        "src_public": src_public,
+        "kill_chain": str(record.get("KillChain") or ""),
         "end_time": str(record.get("EndTime") or ""),
         "ignore": False,
         "reason": "",
