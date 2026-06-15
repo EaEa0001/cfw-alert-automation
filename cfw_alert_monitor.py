@@ -261,10 +261,13 @@ def build_hourly_wecom_message(start_text, end_text, total, rows, judged_rows, d
 
     lines = [f"## 🛡️ 云防火墙告警简报  {window}"]
 
-    # 一行总览
+    # 一行总览(口语化,一眼懂:产生多少、忽略多少噪声、剩多少要管)
+    _total = ac.get("active_before", 0)
+    _ignored = ac.get("ignored_confirmed", 0)
+    _left = ac.get("retained", 0)
     lines.append(
-        f"> 告警中心 检查 **{ac.get('active_before', 0)}** / 自动忽略 **{ac.get('ignored_confirmed', 0)}** / 留存 **{ac.get('retained', 0)}**"
-        + (f"　原始流量 **{len(rows)}**" if rows else "")
+        f"> 本时段共产生 **{_total}** 条告警,自动忽略 **{_ignored}** 条噪声,**剩 {_left} 条需关注**"
+        + (f"(另原始流量 {len(rows)} 条)" if rows else "")
     )
 
     # 按攻击者(源IP集合)聚合,同一组源IP的多手法合并成一条,避免刷屏
