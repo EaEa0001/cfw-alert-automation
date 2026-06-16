@@ -2800,7 +2800,12 @@ def escalate_with_agent(config, rows, judgements, model):
     if not (llm.get("provider") == "codex_direct" and agent_cfg.get("enabled", False)):
         return judgements
 
-    max_alerts = int(agent_cfg.get("max_alerts_per_run", 30))
+    # 小时任务有超时限制,Agent 多轮很慢,只升级最该查的少量;日报无紧超时可多。
+    # HOURLY_MODE 由 safe_hourly 入口设置。
+    if globals().get("_HOURLY_AGENT_MODE"):
+        max_alerts = int(agent_cfg.get("max_alerts_hourly", 15))
+    else:
+        max_alerts = int(agent_cfg.get("max_alerts_per_run", 40))
     max_workers = max(1, int(agent_cfg.get("max_workers", 2)))
 
     targets = []

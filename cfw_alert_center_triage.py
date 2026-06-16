@@ -447,6 +447,8 @@ def deep_triage_records(config, records, labels):
 
 
 def safe_hourly_dispose(config, start, end, dry_run=False):
+    # 标记小时模式:让 Agent 升级用较小上限(防小时任务超时),积压交日报/重试队列。
+    monitor._HOURLY_AGENT_MODE = True
     records, query = fetch_unhandled_alert_center_range(config, start, end)
     labels = whitelist_labels(config)
     # njRAT 等 RAT 告警的探针特征藏在源包里,先给这类记录补拉源包,

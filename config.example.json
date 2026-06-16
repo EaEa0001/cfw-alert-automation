@@ -53,8 +53,9 @@
       "enabled": false,
       "reasoning_effort": "high",
       "max_rounds": 6,
-      "max_alerts_per_run": 30,
-      "max_workers": 2
+      "max_alerts_per_run": 40,
+      "max_workers": 3,
+      "max_alerts_hourly": 15
     },
     "alert_center_auto_dispose": {
       "enabled": true,
