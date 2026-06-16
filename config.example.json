@@ -18,7 +18,7 @@
     "max_bytes": 3800,
     "manual_enabled": true,
     "manual_at_all": true,
-    "manual_max_items": 10,
+    "manual_max_items": 6,
     "manual_webhook_url": "",
     "hourly_at_all_on_critical": true
   },

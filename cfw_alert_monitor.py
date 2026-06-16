@@ -459,23 +459,39 @@ def build_daily_wecom_message(day, events, ip_rows, alert_rows=None):
                     {"actions": payload.get("omit_actions", []) + payload.get("white_actions", [])}
                 )
 
-    return "\n".join(
-        [
-            "## 云防火墙每日告警日报",
-            f"> 日期：{day}，统计截至 {dt_text(now_local())}",
-            f"- 唯一告警：**{len(events)}**，攻击 IP：**{len(ip_rows)}**",
-            f"- 告警等级：{counter_text(levels, ['严重', '高危', '中危', '低危', '提示'])}",
-            f"- 唯一告警最终研判：{counter_text(judgement_counts, ['确认成功', '需人工复核', '确认未成功', '未见成功证据', '扫描探测'])}",
-            f"- 研判来源：{counter_text(source_counts, ['codex_direct_source', 'codex_direct'])}",
-            f"- 模型降级：**{fallback_count}**",
-            f"- 需要关注：{attention_text}",
-            f"- 原始流量处置累计：忽略 **{ignored_alerts}**，加白候选 **{white_candidates}**，失败 **{action_failures}**",
-            f"- 告警中心处置累计：忽略 **{alert_center_ignored}**，最近窗口保留 **{alert_center_latest.get('retained', 0)}**，失败 **{alert_center_failures}**",
-            f"- 主要攻击 IP：{counter_text(ip_counts, limit=8)}",
-            f"- 主要事件：{counter_text(event_names, limit=8)}",
-            "- <font color=\"info\">腾讯云扫描 IP 和公司漏扫 IP 已排除，不执行封禁</font>",
-        ]
-    )
+    # 结论式日报:先给一句话结论,再给关键数字,噪声收起来。
+    total = len(events)
+    confirmed = judgement_counts.get("确认成功", 0)
+    manual = judgement_counts.get("需人工复核", 0)
+    auto_done = total - confirmed - manual  # 自动处理掉的(各类无害结论)
+    total_failures = action_failures + alert_center_failures
+
+    # 一句话结论
+    if confirmed:
+        verdict = f"⚠️ **发现 {confirmed} 条确认成功,需立即处置**"
+    elif total_failures:
+        verdict = f"⚠️ 处置有 **{total_failures}** 条失败,需检查"
+    elif fallback_count >= total * 0.5 and total:
+        verdict = f"⚠️ 模型连接异常,**{fallback_count}** 条降级未深判(已入队,网络恢复自动补判)"
+    elif manual:
+        verdict = f"✅ 无确认得手;**{manual}** 条待人工复核,其余已自动处理"
+    else:
+        verdict = "✅ 全部自动研判处理,无需人工"
+
+    top_ip = counter_text(ip_counts, limit=5)
+    top_ev = counter_text(event_names, limit=5)
+    lines = [
+        f"## 云防火墙日报 {day}",
+        f"> {verdict}",
+        f"- 全天告警 **{total}** 条(高危 {levels.get('高危', 0)})| 攻击IP **{len(ip_rows)}** 个",
+        f"- 处理:自动 **{auto_done + ignored_alerts + alert_center_ignored}** | 待人工 **{manual}** | 确认成功 **{confirmed}**",
+        f"- 主要攻击源:{top_ip}",
+        f"- 主要手法:{top_ev}",
+    ]
+    if fallback_count:
+        lines.append(f"- <font color=\"warning\">模型降级 {fallback_count} 条(已入队待补判)</font>")
+    lines.append("> 扫描IP/漏扫IP已排除不封禁;明细见控制台")
+    return "\n".join(lines)
 
 
 def _find_credential_pair(value):
