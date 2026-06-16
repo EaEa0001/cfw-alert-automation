@@ -80,6 +80,7 @@
       "ids_white_fw_type": 7
     },
     "precheck": true,
-    "precheck_timeout": 6
+    "precheck_timeout": 6,
+    "proxy": ""
   }
 }

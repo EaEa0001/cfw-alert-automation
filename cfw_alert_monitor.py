@@ -1756,6 +1756,33 @@ def load_codex_auth_headers():
     }
 
 
+_CODEX_OPENER = None
+_CODEX_OPENER_KEY = None
+
+
+def _codex_opener(config):
+    """构建走代理的 urllib opener(本机直连 chatgpt.com 不稳,需经本地代理)。
+
+    读 llm.proxy(如 http://127.0.0.1:10808);留空则直连。opener 按 proxy 缓存。
+    """
+    global _CODEX_OPENER, _CODEX_OPENER_KEY
+    proxy = str((config.get("llm") or {}).get("proxy") or "").strip()
+    if _CODEX_OPENER is not None and _CODEX_OPENER_KEY == proxy:
+        return _CODEX_OPENER
+    if proxy:
+        handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        _CODEX_OPENER = urllib.request.build_opener(handler)
+    else:
+        _CODEX_OPENER = urllib.request.build_opener()  # 无代理=直连
+    _CODEX_OPENER_KEY = proxy
+    return _CODEX_OPENER
+
+
+def _codex_urlopen(config, req, timeout):
+    """对 Codex 接口发请求,自动走配置的代理。"""
+    return _codex_opener(config).open(req, timeout=timeout)
+
+
 def codex_direct_prompt(batch, id_map):
     direct_alert = bool(batch and batch[0].get("告警ID"))
     compact_rows = []
@@ -1919,7 +1946,7 @@ def call_codex_direct_batch(config, model, batch):
         usage = {}
         response_id = ""
         try:
-            with urllib.request.urlopen(req, timeout=float(llm.get("timeout_seconds", 180))) as resp:
+            with _codex_urlopen(config, req, float(llm.get("timeout_seconds", 180))) as resp:
                 event_name = None
                 data_lines = []
                 for raw_line in resp:
@@ -2287,7 +2314,7 @@ def _agent_stream_once(config, body):
         calls = {}  # item_id -> {call_id,name,arguments}
         usage = {}
         try:
-            with urllib.request.urlopen(req, timeout=float(llm.get("timeout_seconds", 180))) as resp:
+            with _codex_urlopen(config, req, float(llm.get("timeout_seconds", 180))) as resp:
                 event_name = None
                 data_lines = []
                 for raw in resp:
@@ -2574,7 +2601,7 @@ def call_codex_direct_source_batch(config, model, batch):
         output_chunks = []
         usage = {}
         try:
-            with urllib.request.urlopen(req, timeout=float(llm.get("timeout_seconds", 180))) as resp:
+            with _codex_urlopen(config, req, float(llm.get("timeout_seconds", 180))) as resp:
                 event_name = None
                 data_lines = []
                 for raw_line in resp:
@@ -2711,7 +2738,7 @@ def codex_reachable(config, timeout=6):
         body = json.dumps(codex_direct_request_body(llm.get("model", "gpt-5.5"), "ping", "low"),
                           ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(url, data=body, method="POST", headers=load_codex_auth_headers())
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _codex_urlopen(config, req, timeout) as resp:
             resp.read(64)
         return True
     except urllib.error.HTTPError:
