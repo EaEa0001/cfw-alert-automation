@@ -2000,6 +2000,51 @@ TRIAGE_TOOLS = [
             "required": ["ip"],
         },
     },
+    {
+        "type": "function",
+        "name": "query_flow",
+        "description": (
+            "查询该源IP的真实流量元数据(netflow,即使非HTTP也能查)。返回访问的URL、"
+            "目标端口、源/目标实例名、协议、字节数。当 pull_packets 拉不到HTTP源包时,"
+            "用这个换个角度看流量:URL是业务路径还是攻击路径、源/目标是不是业务服务,"
+            "据此判断是真实攻击还是内网业务被误报。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"ip": {"type": "string", "description": "要查的源IP"}},
+            "required": ["ip"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "identify_asset",
+        "description": (
+            "查询一个IP是什么资产(CVM/容器POD名、是否为 ingress入口/oss存储/网关等"
+            "基础设施)。用于判断:内网源打内网基础设施(ingress/oss)多为业务调用误报;"
+            "打数据库/敏感服务才更可疑。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"ip": {"type": "string", "description": "要查的IP(源或目标)"}},
+            "required": ["ip"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "check_ip_history",
+        "description": (
+            "查询一个IP近期的行为画像:历史告警类型/次数、是否内网、是否曾被人工确认过。"
+            "用于判断这是反复误报的业务IP,还是新出现的可疑源。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ip": {"type": "string", "description": "要查的IP"},
+                "days": {"type": "integer", "description": "回溯天数,默认5"},
+            },
+            "required": ["ip"],
+        },
+    },
 ]
 
 
@@ -2044,10 +2089,121 @@ def _tool_get_related_alerts(config, record, args):
     return {"ip": ip, "count": len(related), "alerts": related[:15]}
 
 
+def _query_netflow_raw(config, ip, record=None, limit=15):
+    """查 netflow_nta 该源IP的流量(任意协议),返回精简元数据列表。"""
+    # 时间窗:优先用告警自身窗口,否则用近6小时
+    def _parse(v):
+        try:
+            return datetime.strptime(str(v), "%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            return None
+    end = _parse((record or {}).get("EndTime")) or now_local()
+    start = _parse((record or {}).get("StartTime")) or (end - timedelta(hours=6))
+    # netflow 只认整点对齐窗口
+    s = start.replace(minute=0, second=0)
+    e = (end.replace(minute=0, second=0) + timedelta(hours=1))
+    try:
+        req = models.DescribeLogsRequest()
+        req.Index = "netflow_nta"
+        req.Limit = limit
+        req.Offset = 0
+        req.StartTime = dt_text(s)
+        req.EndTime = dt_text(e)
+        flt = models.CommonFilter()
+        flt.Name = "src_ip"
+        flt.OperatorType = 1
+        flt.Values = [str(ip)]
+        req.Filters = [flt]
+        resp = build_client(config).DescribeLogs(req)
+        rows = []
+        for r in parse_data(resp.Data):
+            rows.append({k: r.get(k) for k in (
+                "dst_ip", "dst_port", "event_type", "app_protocol",
+                "src_ins_name", "dst_ins_name", "http_url") if r.get(k)})
+        return rows
+    except Exception as exc:
+        return [{"error": str(exc)[:150]}]
+
+
+# 基础设施资产名特征(打这些多为业务调用,误报概率高)
+_INFRA_HINTS = ("ingress", "oss", "gateway", "网关", "nginx", "proxy", "lb-", "slb", "redis", "mq", "kafka")
+
+
+def _tool_query_flow(config, record, args):
+    ip = str(args.get("ip") or "")
+    flows = _query_netflow_raw(config, ip, record, limit=20)
+    if not flows or (len(flows) == 1 and flows[0].get("error")):
+        return {"found": False, "note": "无流量记录", "raw": flows}
+    # 汇总:目标实例、URL、端口
+    urls = sorted({f.get("http_url") for f in flows if f.get("http_url")})[:8]
+    dst_assets = sorted({f.get("dst_ins_name") for f in flows if f.get("dst_ins_name")})[:5]
+    ports = sorted({str(f.get("dst_port")) for f in flows if f.get("dst_port")})
+    src_asset = next((f.get("src_ins_name") for f in flows if f.get("src_ins_name")), "")
+    return {
+        "found": True, "src_asset": src_asset, "dst_assets": dst_assets,
+        "dst_ports": ports[:8], "urls": urls, "flow_count": len(flows),
+    }
+
+
+def _tool_identify_asset(config, record, args):
+    ip = str(args.get("ip") or "")
+    # 先从告警记录里的实例列表找,再从 netflow 找
+    name, atype = "", ""
+    for inst in (record.get("DstInstanceList") or []) + (record.get("SrcInstanceList") or []):
+        if isinstance(inst, dict) and str(inst.get("InstanceIp")) == ip:
+            name, atype = str(inst.get("InstanceName") or ""), str(inst.get("InstanceType") or "")
+            break
+    if not name:
+        flows = _query_netflow_raw(config, ip, record, limit=5)
+        name = next((f.get("src_ins_name") or f.get("dst_ins_name") for f in flows
+                     if f.get("src_ins_name") or f.get("dst_ins_name")), "")
+    is_infra = any(h in str(name).lower() for h in _INFRA_HINTS)
+    try:
+        internal = not __import__("ipaddress").ip_address(ip).is_global
+    except ValueError:
+        internal = False
+    return {"ip": ip, "asset_name": name, "asset_type": atype,
+            "is_infrastructure": is_infra, "internal": internal,
+            "note": "基础设施(ingress/oss/网关等),内网调用多为业务" if is_infra else ""}
+
+
+def _tool_check_ip_history(config, record, args):
+    ip = str(args.get("ip") or "")
+    days = int(args.get("days") or 5)
+    try:
+        internal = not __import__("ipaddress").ip_address(ip).is_global
+    except ValueError:
+        internal = False
+    # 历史告警
+    try:
+        import cfw_alert_center_triage as triage
+        recs, _ = triage.fetch_unhandled_alert_center(config, days)
+    except Exception as exc:
+        return {"error": str(exc)[:150]}
+    from collections import Counter
+    evs = Counter()
+    for r in recs:
+        if ip in [str(x) for x in (r.get("SrcIpList") or [])]:
+            evs[str(r.get("EventName") or "")] += 1
+    # 是否曾人工放弃/确认(retry-giveup 留痕)
+    confirmed = False
+    try:
+        gp = ROOT / "data" / "retry-giveup.jsonl"
+        if gp.exists():
+            confirmed = ip in gp.read_text(encoding="utf-8")
+    except Exception:
+        pass
+    return {"ip": ip, "internal": internal, "alert_types": dict(evs.most_common(8)),
+            "total_alerts": sum(evs.values()), "seen_before": confirmed}
+
+
 TOOL_DISPATCH = {
     "pull_packets": _tool_pull_packets,
     "decode_hex": _tool_decode_hex,
     "get_related_alerts": _tool_get_related_alerts,
+    "query_flow": _tool_query_flow,
+    "identify_asset": _tool_identify_asset,
+    "check_ip_history": _tool_check_ip_history,
 }
 
 
@@ -2066,13 +2222,21 @@ def _agent_request_body(model, input_items, reasoning_effort):
         "model": model,
         "instructions": (
             "你是资深安全告警研判员。判断云防火墙告警攻击是否成功,必须基于工具取到的"
-            "真实证据,不能凭聚合字段或请求特征臆断。可多次调用工具取证。"
+            "真实证据,不能凭聚合字段或请求特征臆断。可多次调用工具取证,要查深查透。"
+            "取证策略(重要):先 pull_packets 拉源包;若拉不到(常见于内网流量),"
+            "不要就此判'未见证据',必须换招继续查:用 query_flow 看该IP真实流量的URL/端口/"
+            "目标实例,用 identify_asset 看源和目标是什么资产,用 check_ip_history 看这IP历史行为。"
+            "综合判断:内网业务节点访问内网基础设施(ingress/oss/网关)、URL是业务路径(如"
+            "/v1/.../geo/conver 这类接口)、无敏感操作 → 是'内网业务被IDS误报',判确认未成功或"
+            "未见成功证据(高置信),不要判需人工。只有出现命令回显/webshell/敏感数据外泄/异常端口"
+            "回连/打数据库等敏感服务,才判确认成功或保留人工。"
             "得到足够证据后,只输出一个紧凑JSON对象(不要解释、不要数组),字段:"
             "result(确认成功/确认未成功/未见成功证据/扫描探测/需人工复核),"
             "confidence(high/medium/low),evidence(判定依据,≤40汉字),"
-            "next(下一步,≤20汉字),key_evidence(支撑结论的源包原文片段,≤120字符,无则空串)。"
+            "next(下一步,≤20汉字),key_evidence(支撑结论的源包原文片段/流量URL/资产名,≤120字符,无则空串)。"
             "确认成功必须有命令回显/文件写入/webshell/敏感数据返回/回连等明确落地证据;"
-            "单独HTTP200、普通页面不算成功。"
+            "单独HTTP200、普通页面、内网业务接口调用不算成功。"
+            "尽量给出确定结论,只有证据确实矛盾或确实高危无法定论时才用需人工复核。"
         ),
         "input": input_items,
         "tools": TRIAGE_TOOLS,
