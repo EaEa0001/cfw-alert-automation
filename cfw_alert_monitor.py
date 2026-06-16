@@ -3212,7 +3212,34 @@ def report(args):
     alert_rows = build_alert_rows(day, events, config)
     if getattr(args, "limit", None):
         alert_rows = alert_rows[: args.limit]
-    alert_judgements = llm_judge_rows(config, alert_rows)
+
+    # 默认复用当天已有研判(秒级出日报),不重判全量;--refresh 才重新研判。
+    # 小时任务已逐条研判过,日报聚合即可;避免每次日报重判几百条拖慢。
+    prior_csv = REPORT_DIR / f"cfw_alert_judgement_{day}.csv"
+    reuse = (not getattr(args, "refresh", False)) and prior_csv.exists()
+    cached = {}
+    if reuse:
+        try:
+            with prior_csv.open("r", encoding="utf-8-sig") as fh:
+                for row in csv.DictReader(fh):
+                    key = judgement_key(row)
+                    if row.get("模型研判"):
+                        cached[key] = row
+        except Exception:
+            cached = {}
+    # 没命中缓存的行才研判(通常是日报窗口内新增的);命中的直接用旧研判
+    todo = [r for r in alert_rows if judgement_key(r) not in cached] if reuse else alert_rows
+    fresh = llm_judge_rows(config, todo) if todo else {}
+    alert_judgements = {}
+    for r in alert_rows:
+        k = judgement_key(r)
+        if k in fresh:
+            alert_judgements[k] = fresh[k]
+        elif k in cached:
+            c = cached[k]
+            alert_judgements[k] = {kk: c.get(kk, "") for kk in (
+                "模型研判", "模型置信度", "研判理由", "下一步", "研判来源", "研判模型",
+                "输入Token", "输出Token", "推理Token", "关键证据")}
     alert_rows = apply_judgements(alert_rows, alert_judgements)
 
     alert_fieldnames = [
