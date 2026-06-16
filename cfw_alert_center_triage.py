@@ -591,6 +591,8 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
         "deep_triaged": len(deep_judgements),
         "deep_ignored": len(set(deep_ignore_ids)),
         "deep_results": dict(Counter(item.get("模型研判", "") for item in deep_judgements.values())),
+        "deep_degraded": sum(1 for item in deep_judgements.values()
+                             if str(item.get("研判来源", "")).startswith("rule_fallback")),
         "retry_queue_consumed": queue_consumed,
         "retry_queue_resolved": queue_resolved,
         "retry_queue_enqueued": queue_enqueued,

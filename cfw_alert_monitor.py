@@ -269,6 +269,14 @@ def build_hourly_wecom_message(start_text, end_text, total, rows, judged_rows, d
         f"> 本时段共产生 **{_total}** 条告警,自动忽略 **{_ignored}** 条噪声,**剩 {_left} 条需关注**"
         + (f"(另原始流量 {len(rows)} 条)" if rows else "")
     )
+    # 模型连接异常时本轮深判被短路降级,这些不是"没研判",是已入队待网络恢复自动补判。
+    _degraded = ac.get("deep_degraded", 0)
+    _enqueued = ac.get("retry_queue_enqueued", 0)
+    if _degraded or _enqueued:
+        lines.append(
+            f"> ⚠️ <font color=\"warning\">本轮模型连接异常,**{max(_degraded, _enqueued)}** 条暂未深判"
+            f"(下方研判为规则初判),已入队,网络恢复后自动用 Agent 补判</font>"
+        )
 
     # 按攻击者(源IP集合)聚合,同一组源IP的多手法合并成一条,避免刷屏
     by_attacker = {}
