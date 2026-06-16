@@ -813,6 +813,18 @@ def main():
     if args.limit:
         records = records[: args.limit]
 
+    # 并入重试队列里之前降级未判出的告警(日报无紧超时,适合补判积压),去重。
+    try:
+        import retry_queue
+        seen_ids = {str(r.get("EventId") or r.get("AlertClusterId") or "") for r in records}
+        for qrec in retry_queue.queued_records(max_records=300):
+            qid = str(qrec.get("EventId") or qrec.get("AlertClusterId") or "")
+            if qid and qid not in seen_ids:
+                records.append(qrec)
+                seen_ids.add(qid)
+    except Exception:
+        retry_queue = None
+
     rows = [record_to_judge_row(record, labels, config) for record in records]
     white_rows = [row for row in rows if row["_white_hits"]]
     llm_rows = [row for row in rows if not row["_white_hits"]]
@@ -835,6 +847,26 @@ def main():
 
     ignore_ids = [row["告警ID"] for row in judged_rows if _can_ignore(row)]
     candidates = white_rule_candidates(rows)
+
+    # 重试队列维护:降级(连接异常/解析失败)的入队,等下次网络好时 Agent 补判;
+    # 判出真模型结果或已忽略的出队。解决"降级→直接挂需人工→再不被补判"导致的人工率虚高。
+    if not args.dry_run:
+        try:
+            rec_by_id = {str(r.get("EventId") or r.get("AlertClusterId") or ""): r for r in records}
+            degraded, resolved = [], []
+            for row in judged_rows:
+                aid = row.get("告警ID")
+                if not aid:
+                    continue
+                if str(row.get("研判来源", "")).startswith("rule_fallback"):
+                    if aid in rec_by_id:
+                        degraded.append(rec_by_id[aid])
+                else:
+                    resolved.append(aid)  # 判出真结果,出队
+            retry_queue.enqueue(degraded, monitor.dt_text(monitor.now_local()))
+            retry_queue.dequeue(set(resolved) | set(ignore_ids))
+        except Exception:
+            pass
 
     REPORT_DIR.mkdir(exist_ok=True)
     DATA_DIR.mkdir(exist_ok=True)

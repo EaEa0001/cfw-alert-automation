@@ -92,13 +92,24 @@ def dequeue(event_ids):
     return removed
 
 
+GIVEUP_PATH = ROOT / "data" / "retry-giveup.jsonl"
+
+
 def queued_records(max_records=200, max_attempts=20):
-    """取出待补判的告警记录(超过 max_attempts 仍判不出的丢弃,避免死循环)。"""
+    """取出待补判的告警记录。
+
+    超过 max_attempts 仍判不出的不再无限补判,但**不静默丢弃** —— 落到
+    retry-giveup.jsonl 留痕(这些是反复自动判不了的,本就该人工看),避免变盲区。
+    """
     items = load_queue()
     stale = [k for k, v in items.items() if v.get("attempts", 0) > max_attempts]
     if stale:
-        for k in stale:
-            del items[k]
+        GIVEUP_PATH.parent.mkdir(exist_ok=True)
+        with GIVEUP_PATH.open("a", encoding="utf-8") as fh:
+            for k in stale:
+                obj = dict(items[k], gave_up=True)
+                fh.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+                del items[k]
         save_queue(items)
     records = [v["record"] for v in items.values()]
     return records[:max_records]
