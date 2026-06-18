@@ -284,11 +284,12 @@ def _danger_level(event_name):
     return 0      # 扫描/探测类
 
 
-def attack_graph(days=7, focus="key", max_edges=200, min_danger=0, collapse_solo=True):
+def attack_graph(days=7, focus="key", max_edges=200, min_danger=0, collapse_solo=True, target=None):
     """攻击拓扑图数据(ECharts graph 格式)。
 
     min_danger: 只画危险度≥此值的边(0全部/1中危以上/2仅高危)。
     collapse_solo: 把"只打1个目标"的零散攻击者折叠成目标上的汇总(降低杂乱)。
+    target: 只看打这个资产(目标IP)的攻击链,聚焦单资产,避免集火图糊成团。
 
     节点:公网攻击者(红)/中转节点(黄,既被攻击又对外攻击)/内网资产(蓝)。
     边:攻击者→目标,颜色按手法危险度。
@@ -320,6 +321,13 @@ def attack_graph(days=7, focus="key", max_edges=200, min_danger=0, collapse_solo
             dst_set.add(dst)
     pivots = src_set & dst_set  # 中转节点
 
+    # 被攻击资产清单(供前端下拉:按被攻击次数排序,带资产名)
+    dst_count = {}
+    for src, dst, ev, danger, level, result in raw:
+        dst_count[dst] = dst_count.get(dst, 0) + 1
+    target_list = [{"ip": ip, "name": asset_name.get(ip, ip), "count": c}
+                   for ip, c in sorted(dst_count.items(), key=lambda kv: -kv[1])]
+
     # 边聚合(同 src-dst 合并,取最高危险度、累加次数)
     edge_agg = {}
     for src, dst, ev, danger, level, result in raw:
@@ -330,6 +338,13 @@ def attack_graph(days=7, focus="key", max_edges=200, min_danger=0, collapse_solo
         e["events"].add(str(ev)[:16])
 
     edges = list(edge_agg.values())
+    # 按资产聚焦:只看打指定目标的攻击链。聚焦单资产时自动展开——关折叠、不做
+    # focus 过滤、放宽危险度,把打这个资产的攻击者全显示(这正是聚焦的目的)。
+    if target:
+        edges = [e for e in edges if e["dst"] == target or e["src"] == target]
+        collapse_solo = False
+        focus = "all"
+        min_danger = 0
     # 危险度过滤(用户筛选项)
     edges = [e for e in edges if e["danger"] >= min_danger]
     # focus=key:只保留 高危手法 或 涉及中转节点 的边
@@ -420,6 +435,7 @@ def attack_graph(days=7, focus="key", max_edges=200, min_danger=0, collapse_solo
                   "pivots": sum(1 for n in nodes if n["category"] == "中转"),
                   "targets": sum(1 for n in nodes if n["category"] == "内网资产"),
                   "edges": len(links), "folded_solo": folded, "focus": focus},
+        "targets_list": target_list,
     }
 
 

@@ -78,6 +78,7 @@ def api_attack_graph():
         focus=request.args.get("focus", "key"),
         min_danger=md,
         collapse_solo=request.args.get("collapse", "1") != "0",
+        target=request.args.get("target") or None,
     ))
 
 
@@ -462,11 +463,14 @@ SCREEN_PAGE = r"""<!doctype html>
     <span><i style="background:#ff5470"></i>公网攻击者</span>
     <span><i style="background:#ffb547"></i>中转节点</span>
     <span><i style="background:#3da9fc"></i>内网资产</span>
-    <label>显示
+    <label>资产
+      <select id="gtarget" onchange="loadGraph()"><option value="">全部资产</option></select>
+    </label>
+    <label>危险
       <select id="gdanger" onchange="loadGraph()">
-        <option value="2" selected>仅高危手法</option>
+        <option value="2" selected>仅高危</option>
         <option value="1">高危+中危</option>
-        <option value="0">全部(含扫描)</option>
+        <option value="0">全部</option>
       </select>
     </label>
     <label><input type="checkbox" id="gcollapse" checked onchange="loadGraph()">折叠零散扫描</label>
@@ -559,12 +563,20 @@ function showPage(p){
   document.getElementById('tb2').classList.toggle('active',p===2);
   if(p===2){ if(!gChart) gChart=echarts.init(document.getElementById('graph'),'dark'); loadGraph(); setTimeout(()=>gChart.resize(),50); }
 }
+let gTargetsLoaded=false;
 async function loadGraph(){
   const days=$('#days')?$('#days').value:7;
-  const md=$('#gdanger')?$('#gdanger').value:1;
+  const md=$('#gdanger')?$('#gdanger').value:2;
   const cl=($('#gcollapse')&&$('#gcollapse').checked)?1:0;
-  const g=await (await fetch(`/api/attack_graph?days=${days}&min_danger=${md}&collapse=${cl}`)).json();
+  const tg=$('#gtarget')?$('#gtarget').value:'';
+  const g=await (await fetch(`/api/attack_graph?days=${days}&min_danger=${md}&collapse=${cl}&target=${encodeURIComponent(tg)}`)).json();
   const st=g.stats||{};
+  // 填充资产下拉(只首次/换天时填,保留当前选择)
+  if(g.targets_list){
+    const sel=$('#gtarget'), cur=sel.value;
+    sel.innerHTML='<option value=\"\">全部资产</option>'+g.targets_list.map(t=>`<option value=\"${esc(t.ip)}\">${esc(t.name)} (${t.count})</option>`).join('');
+    sel.value=cur;
+  }
   $('#gstats').textContent=`攻击者 ${st.attackers} · 中转 ${st.pivots} · 资产 ${st.targets} · 边 ${st.edges}`+(st.folded_solo?` · 已折叠零散 ${st.folded_solo}`:'');
   const cats=[{name:'公网攻击者'},{name:'中转'},{name:'内网资产'}];
   const nodes=g.nodes.map(n=>({
