@@ -29,7 +29,7 @@ ATTACK_RESULT_MAP = {
     "2": "攻击失败",
     "3": "尝试/探测",
 }
-IGNORE_RESULTS = {"确认未成功", "未见成功证据", "扫描探测"}
+IGNORE_RESULTS = {"确认未成功", "未见成功证据", "扫描探测", "业务误报"}
 SAFE_SCAN_KEYWORDS = (
     "扫描",
     "探测",
