@@ -275,7 +275,8 @@ def asset_cards(days=7, only_notable=True, limit=40):
                 continue
             g = agg.setdefault(dst, {"ip": dst, "count": 0, "attackers": {},
                                      "events": {}, "max_danger": 0, "high": 0,
-                                     "success": 0, "last": ""})
+                                     "success": 0, "last": "", "results": {},
+                                     "fp": 0, "real": 0})
             g["count"] += 1
             g["max_danger"] = max(g["max_danger"], danger)
             if src:
@@ -286,33 +287,52 @@ def asset_cards(days=7, only_notable=True, limit=40):
                 g["high"] += 1
             if result == "确认成功":
                 g["success"] += 1
+            if result:
+                g["results"][result] = g["results"].get(result, 0) + 1
+            # 误报 vs 真攻击:业务误报/扫描探测=误报噪声;其余(确认成功/未成功/未见成功/需人工)=真攻击
+            if result in ("业务误报", "扫描探测"):
+                g["fp"] += 1
+            elif result:
+                g["real"] += 1
             t = r.get("告警时间", "")
             if t > g["last"]:
                 g["last"] = t
 
     cards, trivial = [], {"assets": 0, "count": 0}
     for dst, g in agg.items():
-        notable = (g["max_danger"] >= 2 or g["success"] > 0 or g["high"] > 0
-                   or len(g["attackers"]) >= 3 or g["count"] >= 5)
+        # 值得关注:有真攻击(含得手/未成功/未见成功)即关注;全是误报的只在量大时才出卡
+        notable = (g["success"] > 0 or g["real"] > 0 or g["max_danger"] >= 2
+                   or len(g["attackers"]) >= 3 or g["count"] >= 8)
+        # 卡片定性:有得手→已得手(红);有真攻击(未成功/未见成功证据)→真攻击(黄);
+        # 全是误报/扫描→误报(灰,可忽略)。
+        if g["success"]:
+            band = "已得手"
+        elif g["real"] > 0:
+            band = "真攻击"
+        else:
+            band = "误报"
         card = {
             "ip": dst, "name": asset_name.get(dst, dst),
             "internal": not _is_public(dst),
             "count": g["count"], "attacker_count": len(g["attackers"]),
             "high": g["high"], "success": g["success"], "max_danger": g["max_danger"],
+            "fp": g["fp"], "real": g["real"], "results": g["results"],
             "last": g["last"],
             "top_events": sorted(g["events"].items(), key=lambda kv: -kv[1])[:5],
             "top_attackers": sorted(g["attackers"].items(), key=lambda kv: -kv[1])[:5],
-            "band": "高危" if (g["success"] or g["max_danger"] >= 2) else ("关注" if g["high"] or len(g["attackers"]) >= 3 else "一般"),
+            "band": band,
         }
         if only_notable and not notable:
             trivial["assets"] += 1
             trivial["count"] += g["count"]
             continue
         cards.append(card)
-    # 排序:得手 > 高危手法 > 攻击者数 > 次数
-    cards.sort(key=lambda c: (c["success"], c["max_danger"], c["attacker_count"], c["count"]), reverse=True)
+    # 排序:得手 > 真攻击数 > 高危手法 > 攻击者数 > 次数(真攻击的资产排前面,误报沉底)
+    cards.sort(key=lambda c: (c["success"], c["real"], c["max_danger"], c["attacker_count"], c["count"]), reverse=True)
     return {"cards": cards[:limit], "trivial": trivial,
-            "total_assets": len(agg)}
+            "total_assets": len(agg),
+            "summary": {"real_assets": sum(1 for c in cards if c["band"] in ("已得手", "真攻击")),
+                        "fp_assets": sum(1 for c in cards if c["band"] == "误报")}}
 
 
 def realtime_attention(days=2, limit=30):

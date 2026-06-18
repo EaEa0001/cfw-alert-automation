@@ -441,7 +441,8 @@ SCREEN_PAGE = r"""<!doctype html>
   .cardwall{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px;}
   .acard{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--mut);
          border-radius:12px;padding:14px 16px;}
-  .acard.b-高危{border-left-color:var(--hi);} .acard.b-关注{border-left-color:var(--warn);}
+  .acard.b-已得手{border-left-color:var(--hi);} .acard.b-真攻击{border-left-color:var(--warn);}
+  .acard.b-误报{border-left-color:var(--mut);opacity:.72;}
   .acard .ah{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;}
   .acard .aname{font-size:16px;font-weight:700;}
   .acard .anum{color:var(--mut);font-size:13px;margin-bottom:10px;}
@@ -450,6 +451,7 @@ SCREEN_PAGE = r"""<!doctype html>
   .acard .afoot{color:var(--mut);font-size:11px;margin-top:10px;text-align:right;}
   .bd{padding:2px 9px;border-radius:10px;font-size:12px;}
   .bd-hi{background:#3a1622;color:var(--hi);} .bd-wn{background:#3a3016;color:var(--warn);}
+  .bd-fp{background:#1b2230;color:var(--mut);}
   .chip{display:inline-block;background:#11161f;border:1px solid var(--line);border-radius:5px;
         padding:2px 8px;margin:2px 5px 2px 0;font-size:12px;color:#cfd8e6;}
   .chip.atk{font-family:Consolas,monospace;color:#ff9aab;}
@@ -577,18 +579,21 @@ async function loadCards(){
   const days=$('#days')?$('#days').value:7;
   const all=($('#cardall')&&$('#cardall').checked)?1:0;
   const d=await (await fetch(`/api/asset_cards?days=${days}&all=${all}`)).json();
-  const tv=d.trivial||{};
-  $('#cardstats').textContent=`共 ${d.total_assets} 个资产被攻击，出卡 ${d.cards.length}`+(tv.assets?` · 另 ${tv.assets} 个零散扫描资产(${tv.count}次)已折叠`:'');
+  const tv=d.trivial||{}, sm=d.summary||{};
+  $('#cardstats').textContent=`真攻击资产 ${sm.real_assets||0} · 误报资产 ${sm.fp_assets||0}`+(tv.assets?` · 另 ${tv.assets} 个零散扫描已折叠`:'');
+  const badgeMap={'已得手':'<span class="bd bd-hi">⚠️已得手</span>','真攻击':'<span class="bd bd-wn">真实攻击</span>','误报':'<span class="bd bd-fp">误报</span>'};
   $('#cards').innerHTML = d.cards.map(c=>{
     const evs=c.top_events.map(e=>`<span class="chip">${esc(e[0])} ×${e[1]}</span>`).join('');
     const atk=c.top_attackers.map(a=>`<span class="chip atk">${esc(a[0])} ×${a[1]}</span>`).join('');
-    const badge = c.success? '<span class="bd bd-hi">⚠️已得手</span>' : (c.max_danger>=2?'<span class="bd bd-hi">高危手法</span>':(c.high?'<span class="bd bd-wn">含高危</span>':''));
+    // 研判构成:真攻击(红) vs 误报(灰)
+    const compo=`<span class="hi">真攻击 ${c.real}</span> · <span class="muted">误报 ${c.fp}</span>`+(c.success?` · <span class="hi">⚠️得手 ${c.success}</span>`:'');
     return `<div class="acard b-${c.band}">
       <div class="ah">
         <div class="aname">${c.internal?'🏠':'🌐'} ${esc(c.name)}</div>
-        ${badge}
+        ${badgeMap[c.band]||''}
       </div>
-      <div class="anum"><b>${c.count}</b> 次攻击 · <b>${c.attacker_count}</b> 个攻击源${c.success?` · <span class="hi">得手 ${c.success}</span>`:''}</div>
+      <div class="anum"><b>${c.count}</b> 次攻击 · <b>${c.attacker_count}</b> 个攻击源</div>
+      <div class="anum">${compo}</div>
       <div class="alab">攻击手法</div><div>${evs}</div>
       <div class="alab">主要攻击源</div><div>${atk}</div>
       <div class="afoot">最近 ${esc((c.last||'').slice(5,16))}</div>
