@@ -284,8 +284,11 @@ def _danger_level(event_name):
     return 0      # 扫描/探测类
 
 
-def attack_graph(days=7, focus="key", max_edges=200):
+def attack_graph(days=7, focus="key", max_edges=200, min_danger=0, collapse_solo=True):
     """攻击拓扑图数据(ECharts graph 格式)。
+
+    min_danger: 只画危险度≥此值的边(0全部/1中危以上/2仅高危)。
+    collapse_solo: 把"只打1个目标"的零散攻击者折叠成目标上的汇总(降低杂乱)。
 
     节点:公网攻击者(红)/中转节点(黄,既被攻击又对外攻击)/内网资产(蓝)。
     边:攻击者→目标,颜色按手法危险度。
@@ -327,22 +330,44 @@ def attack_graph(days=7, focus="key", max_edges=200):
         e["events"].add(str(ev)[:16])
 
     edges = list(edge_agg.values())
+    # 危险度过滤(用户筛选项)
+    edges = [e for e in edges if e["danger"] >= min_danger]
     # focus=key:只保留 高危手法 或 涉及中转节点 的边
     if focus == "key":
         edges = [e for e in edges if e["danger"] >= 1 or e["src"] in pivots or e["dst"] in pivots]
     edges.sort(key=lambda e: (e["danger"], e["count"]), reverse=True)
     edges = edges[:max_edges]
 
-    # 只保留出现在边里的节点
+    # 折叠"只打1个目标"的零散公网攻击者:不画独立点,聚合到目标上计数
+    solo_per_target = {}  # dst -> {count: n, srcs: set}
+    if collapse_solo:
+        out_deg = {}
+        for e in edges:
+            out_deg[e["src"]] = out_deg.get(e["src"], 0) + 1
+        kept = []
+        for e in edges:
+            # 源是公网、且只连这1个目标、且非中转 → 折叠
+            if e["src"] not in pivots and _is_public(e["src"]) and out_deg.get(e["src"], 0) == 1:
+                t = e["dst"]
+                g = solo_per_target.setdefault(t, {"count": 0, "srcs": set(), "danger": 0})
+                g["count"] += 1
+                g["srcs"].add(e["src"])
+                g["danger"] = max(g["danger"], e["danger"])
+            else:
+                kept.append(e)
+        edges = kept
+
     used = set()
     for e in edges:
         used.add(e["src"]); used.add(e["dst"])
+    used.update(solo_per_target.keys())  # 被折叠攻击的目标也要在
 
-    # 节点度数(连了几条边)
     degree = {}
     for e in edges:
         degree[e["src"]] = degree.get(e["src"], 0) + e["count"]
         degree[e["dst"]] = degree.get(e["dst"], 0) + e["count"]
+    for t, g in solo_per_target.items():
+        degree[t] = degree.get(t, 0) + g["count"]
 
     nodes = []
     for ip in used:
@@ -361,7 +386,8 @@ def attack_graph(days=7, focus="key", max_edges=200):
             "category": cat,
             "color": color,
             "value": deg,
-            "size": min(8 + deg * 1.5, 45),
+            "size": min(8 + deg * 1.6, 48),
+            "show_label": deg >= 3 or is_pivot or not is_pub,  # 只给枢纽/中转/资产显示标签
         })
 
     links = []
@@ -369,18 +395,31 @@ def attack_graph(days=7, focus="key", max_edges=200):
         ecolor = "#ff5470" if e["danger"] == 2 else ("#ffb547" if e["danger"] == 1 else "#56607a")
         links.append({
             "source": e["src"], "target": e["dst"],
-            "value": e["count"],
-            "danger": e["danger"],
-            "events": "、".join(sorted(e["events"])[:4]),
-            "color": ecolor,
+            "value": e["count"], "danger": e["danger"],
+            "events": "、".join(sorted(e["events"])[:4]), "color": ecolor,
+        })
+
+    # 折叠的零散攻击者:每个目标加一个"零散扫描源"汇总节点 + 一条边
+    folded = 0
+    for t, g in solo_per_target.items():
+        sid = f"__solo__{t}"
+        n = len(g["srcs"])
+        folded += n
+        nodes.append({
+            "id": sid, "name": f"零散扫描 ×{n}", "category": "公网攻击者",
+            "color": "#7a3b48", "value": n, "size": min(10 + n * 0.8, 30), "show_label": True,
+        })
+        links.append({
+            "source": sid, "target": t, "value": g["count"], "danger": g["danger"],
+            "events": f"{n} 个一次性扫描源", "color": "#56607a",
         })
 
     return {
         "nodes": nodes, "links": links,
-        "stats": {"attackers": sum(1 for n in nodes if n["category"] == "公网攻击者"),
+        "stats": {"attackers": sum(1 for n in nodes if n["category"] == "公网攻击者" and not n["id"].startswith("__solo__")),
                   "pivots": sum(1 for n in nodes if n["category"] == "中转"),
                   "targets": sum(1 for n in nodes if n["category"] == "内网资产"),
-                  "edges": len(links), "focus": focus},
+                  "edges": len(links), "folded_solo": folded, "focus": focus},
     }
 
 

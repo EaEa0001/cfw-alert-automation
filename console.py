@@ -69,7 +69,16 @@ def api_realtime():
 
 @app.route("/api/attack_graph")
 def api_attack_graph():
-    return jsonify(stats.attack_graph(_days(), focus=request.args.get("focus", "key")))
+    try:
+        md = int(request.args.get("min_danger", 2))
+    except (TypeError, ValueError):
+        md = 2
+    return jsonify(stats.attack_graph(
+        _days(),
+        focus=request.args.get("focus", "key"),
+        min_danger=md,
+        collapse_solo=request.args.get("collapse", "1") != "0",
+    ))
 
 
 @app.route("/screen")
@@ -418,6 +427,8 @@ SCREEN_PAGE = r"""<!doctype html>
   .glegend{display:flex;align-items:center;gap:18px;font-size:13px;color:var(--mut);margin-bottom:8px;}
   .glegend i{display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:5px;vertical-align:middle;}
   .gst{color:var(--fg);}
+  .glegend select{background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:3px 6px;margin-left:4px;}
+  .glegend label{display:inline-flex;align-items:center;gap:4px;}
 </style>
 </head>
 <body>
@@ -449,10 +460,18 @@ SCREEN_PAGE = r"""<!doctype html>
 <div id="page2" style="display:none;height:calc(100vh - 60px);padding:14px 20px;">
   <div class="glegend">
     <span><i style="background:#ff5470"></i>公网攻击者</span>
-    <span><i style="background:#ffb547"></i>中转节点(被打又对外打)</span>
+    <span><i style="background:#ffb547"></i>中转节点</span>
     <span><i style="background:#3da9fc"></i>内网资产</span>
+    <label>显示
+      <select id="gdanger" onchange="loadGraph()">
+        <option value="2" selected>仅高危手法</option>
+        <option value="1">高危+中危</option>
+        <option value="0">全部(含扫描)</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="gcollapse" checked onchange="loadGraph()">折叠零散扫描</label>
     <span class="gst" id="gstats"></span>
-    <span style="margin-left:auto">连线 红=高危手法 黄=中危 灰=扫描;点节点高亮其攻击关系</span>
+    <span style="margin-left:auto">点节点高亮其攻击关系</span>
   </div>
   <div id="graph" style="width:100%;height:calc(100% - 36px);"></div>
 </div>
@@ -542,15 +561,17 @@ function showPage(p){
 }
 async function loadGraph(){
   const days=$('#days')?$('#days').value:7;
-  const g=await (await fetch('/api/attack_graph?days='+days)).json();
+  const md=$('#gdanger')?$('#gdanger').value:1;
+  const cl=($('#gcollapse')&&$('#gcollapse').checked)?1:0;
+  const g=await (await fetch(`/api/attack_graph?days=${days}&min_danger=${md}&collapse=${cl}`)).json();
   const st=g.stats||{};
-  $('#gstats').textContent=`攻击者 ${st.attackers} · 中转 ${st.pivots} · 资产 ${st.targets} · 攻击边 ${st.edges}`;
+  $('#gstats').textContent=`攻击者 ${st.attackers} · 中转 ${st.pivots} · 资产 ${st.targets} · 边 ${st.edges}`+(st.folded_solo?` · 已折叠零散 ${st.folded_solo}`:'');
   const cats=[{name:'公网攻击者'},{name:'中转'},{name:'内网资产'}];
   const nodes=g.nodes.map(n=>({
     id:n.id, name:n.name, symbolSize:n.size,
     category:cats.findIndex(c=>c.name===n.category),
     itemStyle:{color:n.color},
-    label:{show:n.size>=18}
+    label:{show:n.show_label!==false}
   }));
   const links=g.links.map(l=>({
     source:l.source, target:l.target,
