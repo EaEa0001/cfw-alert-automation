@@ -265,8 +265,10 @@ def build_hourly_wecom_message(start_text, end_text, total, rows, judged_rows, d
     _total = ac.get("active_before", 0)
     _ignored = ac.get("ignored_confirmed", 0)
     _left = ac.get("retained", 0)
+    _dedup = ac.get("dedup_removed", 0)
     lines.append(
         f"> 本时段共产生 **{_total}** 条告警,自动忽略 **{_ignored}** 条噪声,**剩 {_left} 条需关注**"
+        + (f"(已合并 {_dedup} 条容器转发重复)" if _dedup else "")
         + (f"(另原始流量 {len(rows)} 条)" if rows else "")
     )
     # 模型连接异常时本轮深判被短路降级,这些不是"没研判",是已入队待网络恢复自动补判。

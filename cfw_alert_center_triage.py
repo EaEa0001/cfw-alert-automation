@@ -219,6 +219,78 @@ def parse_local_time(value):
         return None
 
 
+def merge_forward_duplicates(records, window_sec=30):
+    """合并"容器转发导致一次攻击报两次"的重复告警。
+
+    指纹 = 攻击源IP + 事件名 + 规则ID(去掉目标host/时间/告警ID 这些转发会变的)。
+    同指纹 且 时间相差 ≤window_sec 的判为同一次攻击的转发重复,合并成 1 条主告警:
+    - 保留信息最全的那条为主(优先有内网资产名的);
+    - 合并各跳目标IP/资产到主告警的 DstIpList/DstInstanceList;
+    - Count 累加;_merged_count / _merged_ids 留痕。
+    时间相差大的(同源同事件但隔很久=独立的多次攻击)不合并。
+    返回 (merged_records, stats)。
+    """
+    def fp(r):
+        src = "|".join(sorted(str(x) for x in (r.get("SrcIpList") or [])))
+        rules = "|".join(sorted(str(x) for x in (r.get("RuleIdList") or [])))
+        return (src, str(r.get("EventName") or ""), rules,
+                str(r.get("Level") or ""), str(r.get("Direction") or ""))
+
+    groups = {}
+    order = []
+    for r in records:
+        key = fp(r)
+        t = parse_local_time(r.get("EndTime")) or parse_local_time(r.get("StartTime"))
+        placed = False
+        # 找同指纹、且时间在窗口内的已有簇
+        for cluster in groups.get(key, []):
+            if t and cluster["_t"] and abs((t - cluster["_t"]).total_seconds()) <= window_sec:
+                cluster["members"].append(r)
+                placed = True
+                break
+        if not placed:
+            cluster = {"_t": t, "members": [r]}
+            groups.setdefault(key, []).append(cluster)
+            order.append(cluster)
+
+    merged = []
+    dup_removed = 0
+    for cluster in order:
+        members = cluster["members"]
+        if len(members) == 1:
+            merged.append(members[0])
+            continue
+        # 选主:优先有内网资产名、目标多的
+        def richness(r):
+            return (len(r.get("DstInstanceList") or []), len(r.get("DstIpList") or []))
+        members.sort(key=richness, reverse=True)
+        main = dict(members[0])
+        # 合并目标 IP / 资产
+        dst_ips, dst_insts, ids = [], [], []
+        seen_ip, seen_inst = set(), set()
+        for mb in members:
+            for ip in (mb.get("DstIpList") or []):
+                if str(ip) not in seen_ip:
+                    seen_ip.add(str(ip)); dst_ips.append(ip)
+            for inst in (mb.get("DstInstanceList") or []):
+                iid = str(inst.get("InstanceId") or inst.get("InstanceIp") or inst)
+                if iid not in seen_inst:
+                    seen_inst.add(iid); dst_insts.append(inst)
+            eid = str(mb.get("EventId") or mb.get("AlertClusterId") or "")
+            if eid:
+                ids.append(eid)
+        main["DstIpList"] = dst_ips
+        main["DstInstanceList"] = dst_insts
+        main["DstIpNum"] = len(dst_ips)
+        main["Count"] = sum(int(mb.get("Count") or 1) for mb in members)
+        main["_merged_count"] = len(members)
+        main["_merged_ids"] = ids
+        merged.append(main)
+        dup_removed += len(members) - 1
+
+    return merged, {"before": len(records), "after": len(merged), "dup_removed": dup_removed}
+
+
 def local_events_for_record(record):
     start = parse_local_time(record.get("StartTime"))
     end = parse_local_time(record.get("EndTime"))
@@ -450,6 +522,8 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
     # 标记小时模式:让 Agent 升级用较小上限(防小时任务超时),积压交日报/重试队列。
     monitor._HOURLY_AGENT_MODE = True
     records, query = fetch_unhandled_alert_center_range(config, start, end)
+    # 合并容器转发导致的重复告警(一次攻击报两次),研判前去重,降噪+省token
+    records, dedup_stats = merge_forward_duplicates(records)
     labels = whitelist_labels(config)
     # njRAT 等 RAT 告警的探针特征藏在源包里,先给这类记录补拉源包,
     # 以便 safe_hourly_decision 能确定性识别 Shodan 探针误报。
@@ -579,6 +653,7 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
         "query_end": query["end"],
         "query_total": query["total"],
         "active_before": len(records),
+        "dedup_removed": dedup_stats.get("dup_removed", 0),
         "selected_ignore": len(set(ignore_ids)),
         "ignored_confirmed": 0 if dry_run else len({event_id for event_id in ignore_ids if event_id not in remaining_ids}),
         "retained": len(remaining),
@@ -814,6 +889,8 @@ def main():
         records, query = fetch_unhandled_alert_center_range(config, args.start, args.end)
     else:
         records, query = fetch_unhandled_alert_center(config, args.days)
+    # 合并容器转发重复告警(一次攻击报两次),研判前去重
+    records, dedup_stats = merge_forward_duplicates(records)
     if args.limit:
         records = records[: args.limit]
 
