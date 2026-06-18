@@ -270,6 +270,120 @@ def realtime_attention(days=2, limit=30):
     return out[:limit]
 
 
+# 危险手法关键词(连线标红)
+_DANGER_KW = ("RCE", "代码执行", "命令注入", "命令执行", "webshell", "WebShell",
+              "文件上传", "上传可疑", "反序列化", "njRAT", "木马", "注入", "文件读取", "目录遍历")
+
+
+def _danger_level(event_name):
+    n = str(event_name or "")
+    if any(k in n for k in ("RCE", "代码执行", "命令注入", "命令执行", "webshell", "WebShell", "njRAT", "木马", "反序列化")):
+        return 2  # 高危手法
+    if any(k in n for k in _DANGER_KW):
+        return 1  # 中
+    return 0      # 扫描/探测类
+
+
+def attack_graph(days=7, focus="key", max_edges=200):
+    """攻击拓扑图数据(ECharts graph 格式)。
+
+    节点:公网攻击者(红)/中转节点(黄,既被攻击又对外攻击)/内网资产(蓝)。
+    边:攻击者→目标,颜色按手法危险度。
+    focus='key' 默认只画"值得看的"(高危手法 + 中转节点相关),避免糊成一团;
+    focus='all' 画全部。
+    """
+    rows = load_judgements(days)
+    # 先建原始边 + 节点角色
+    raw = []  # (src, dst, event, danger, level, result)
+    src_set, dst_set = set(), set()
+    asset_name = {}  # ip -> 资产名
+    for r in rows:
+        src = str(r.get("攻击IP", "")).split("|")[0].strip()
+        if not src:
+            continue
+        # 解析目标资产名:格式 id/name/type/ip(多个用 | 分隔),建 ip->name
+        for part in str(r.get("目标资产", "")).split("|"):
+            seg = part.split("/")
+            if len(seg) >= 4 and seg[3].strip():
+                asset_name[seg[3].strip()] = seg[1].strip() or seg[3].strip()
+        ev = r.get("事件名称", "")
+        danger = _danger_level(ev)
+        for dst in str(r.get("目标IP", "")).split("|"):
+            dst = dst.strip()
+            if not dst:
+                continue
+            raw.append((src, dst, ev, danger, r.get("告警等级", ""), r.get("模型研判", "")))
+            src_set.add(src)
+            dst_set.add(dst)
+    pivots = src_set & dst_set  # 中转节点
+
+    # 边聚合(同 src-dst 合并,取最高危险度、累加次数)
+    edge_agg = {}
+    for src, dst, ev, danger, level, result in raw:
+        k = (src, dst)
+        e = edge_agg.setdefault(k, {"src": src, "dst": dst, "count": 0, "danger": 0, "events": set()})
+        e["count"] += 1
+        e["danger"] = max(e["danger"], danger)
+        e["events"].add(str(ev)[:16])
+
+    edges = list(edge_agg.values())
+    # focus=key:只保留 高危手法 或 涉及中转节点 的边
+    if focus == "key":
+        edges = [e for e in edges if e["danger"] >= 1 or e["src"] in pivots or e["dst"] in pivots]
+    edges.sort(key=lambda e: (e["danger"], e["count"]), reverse=True)
+    edges = edges[:max_edges]
+
+    # 只保留出现在边里的节点
+    used = set()
+    for e in edges:
+        used.add(e["src"]); used.add(e["dst"])
+
+    # 节点度数(连了几条边)
+    degree = {}
+    for e in edges:
+        degree[e["src"]] = degree.get(e["src"], 0) + e["count"]
+        degree[e["dst"]] = degree.get(e["dst"], 0) + e["count"]
+
+    nodes = []
+    for ip in used:
+        is_pivot = ip in pivots
+        is_pub = _is_public(ip)
+        if is_pivot:
+            cat, color = "中转", "#ffb547"
+        elif is_pub:
+            cat, color = "公网攻击者", "#ff5470"
+        else:
+            cat, color = "内网资产", "#3da9fc"
+        deg = degree.get(ip, 1)
+        nodes.append({
+            "id": ip,
+            "name": asset_name.get(ip, ip),
+            "category": cat,
+            "color": color,
+            "value": deg,
+            "size": min(8 + deg * 1.5, 45),
+        })
+
+    links = []
+    for e in edges:
+        ecolor = "#ff5470" if e["danger"] == 2 else ("#ffb547" if e["danger"] == 1 else "#56607a")
+        links.append({
+            "source": e["src"], "target": e["dst"],
+            "value": e["count"],
+            "danger": e["danger"],
+            "events": "、".join(sorted(e["events"])[:4]),
+            "color": ecolor,
+        })
+
+    return {
+        "nodes": nodes, "links": links,
+        "stats": {"attackers": sum(1 for n in nodes if n["category"] == "公网攻击者"),
+                  "pivots": sum(1 for n in nodes if n["category"] == "中转"),
+                  "targets": sum(1 for n in nodes if n["category"] == "内网资产"),
+                  "edges": len(links), "focus": focus},
+    }
+
+
 def health(days=7):
     """健康面板:LLM 错误/降级、处置失败、源包命中率、Agent 占比、企微发送。"""
     cutoff = datetime.now() - timedelta(days=days)

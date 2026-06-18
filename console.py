@@ -67,6 +67,11 @@ def api_realtime():
     return jsonify(stats.realtime_attention(_days()))
 
 
+@app.route("/api/attack_graph")
+def api_attack_graph():
+    return jsonify(stats.attack_graph(_days(), focus=request.args.get("focus", "key")))
+
+
 @app.route("/screen")
 def screen():
     return SCREEN_PAGE
@@ -370,6 +375,7 @@ SCREEN_PAGE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>云防火墙安全态势大屏</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
 <style>
   :root{--bg:#070b14;--panel:#0e1726;--line:#1b2942;--fg:#e8f0fb;--mut:#6b7d99;
         --hi:#ff5470;--ok:#28d49a;--warn:#ffb547;--acc:#3da9fc;--acc2:#9d7bff;}
@@ -405,14 +411,25 @@ SCREEN_PAGE = r"""<!doctype html>
   .bar{height:7px;border-radius:4px;background:linear-gradient(90deg,var(--acc),var(--acc2));}
   .blink{animation:bk 1.4s infinite;} @keyframes bk{50%{opacity:.4;}}
   .updated{color:var(--mut);font-size:12px;}
+  .tabs{display:flex;gap:6px;}
+  .stab{background:transparent;color:var(--mut);border:1px solid var(--line);border-radius:8px;
+        padding:6px 16px;font-size:14px;cursor:pointer;}
+  .stab.active{background:var(--acc);color:#06101f;border-color:var(--acc);font-weight:600;}
+  .glegend{display:flex;align-items:center;gap:18px;font-size:13px;color:var(--mut);margin-bottom:8px;}
+  .glegend i{display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:5px;vertical-align:middle;}
+  .gst{color:var(--fg);}
 </style>
 </head>
 <body>
 <div class="top">
   <h1>🛡️ 云防火墙安全态势大屏 <span class="dot">● 实时</span></h1>
+  <div class="tabs">
+    <button id="tb1" class="stab active" onclick="showPage(1)">近期动态</button>
+    <button id="tb2" class="stab" onclick="showPage(2)">攻击画像</button>
+  </div>
   <div><span class="clock" id="clock"></span>　<span class="updated" id="upd"></span></div>
 </div>
-<div class="grid">
+<div class="grid" id="page1">
   <div class="kpi"><div class="label">今日告警总量</div><div class="num acc" id="k_total">-</div><div class="sub" id="k_total_s"></div></div>
   <div class="kpi"><div class="label">自动处置</div><div class="num ok" id="k_auto">-</div><div class="sub" id="k_auto_s"></div></div>
   <div class="kpi"><div class="label">需人工复核</div><div class="num warn" id="k_manual">-</div><div class="sub">待处理</div></div>
@@ -427,6 +444,17 @@ SCREEN_PAGE = r"""<!doctype html>
   <div class="panel span2 row2"><h2>🔴 需重点关注(实时)</h2><div class="body"><table id="attention"></table></div></div>
   <div class="panel"><h2>🟡 研判来源</h2><div class="body"><table id="sources"></table></div></div>
   <div class="panel"><h2>🪙 Token 用量</h2><div class="body"><table id="tokens"></table></div></div>
+</div>
+
+<div id="page2" style="display:none;height:calc(100vh - 60px);padding:14px 20px;">
+  <div class="glegend">
+    <span><i style="background:#ff5470"></i>公网攻击者</span>
+    <span><i style="background:#ffb547"></i>中转节点(被打又对外打)</span>
+    <span><i style="background:#3da9fc"></i>内网资产</span>
+    <span class="gst" id="gstats"></span>
+    <span style="margin-left:auto">连线 红=高危手法 黄=中危 灰=扫描;点节点高亮其攻击关系</span>
+  </div>
+  <div id="graph" style="width:100%;height:calc(100% - 36px);"></div>
 </div>
 <script>
 let trendC,resultC;
@@ -502,7 +530,53 @@ async function load(){
 
   $('#upd').textContent='更新 '+new Date().toLocaleTimeString();
 }
-load();setInterval(load,30000);
+
+// ===== 第2页:攻击拓扑图 =====
+let gChart=null, gLoaded=false;
+function showPage(p){
+  document.getElementById('page1').style.display = p===1?'':'none';
+  document.getElementById('page2').style.display = p===2?'':'none';
+  document.getElementById('tb1').classList.toggle('active',p===1);
+  document.getElementById('tb2').classList.toggle('active',p===2);
+  if(p===2){ if(!gChart) gChart=echarts.init(document.getElementById('graph'),'dark'); loadGraph(); setTimeout(()=>gChart.resize(),50); }
+}
+async function loadGraph(){
+  const days=$('#days')?$('#days').value:7;
+  const g=await (await fetch('/api/attack_graph?days='+days)).json();
+  const st=g.stats||{};
+  $('#gstats').textContent=`攻击者 ${st.attackers} · 中转 ${st.pivots} · 资产 ${st.targets} · 攻击边 ${st.edges}`;
+  const cats=[{name:'公网攻击者'},{name:'中转'},{name:'内网资产'}];
+  const nodes=g.nodes.map(n=>({
+    id:n.id, name:n.name, symbolSize:n.size,
+    category:cats.findIndex(c=>c.name===n.category),
+    itemStyle:{color:n.color},
+    label:{show:n.size>=18}
+  }));
+  const links=g.links.map(l=>({
+    source:l.source, target:l.target,
+    lineStyle:{color:l.color, width:Math.min(1+l.value*0.4,6), opacity:l.danger>=2?0.9:0.5, curveness:0.15},
+    tooltip:{formatter:`${l.source} → ${l.target}<br/>手法:${l.events}<br/>次数:${l.value}`}
+  }));
+  gChart.setOption({
+    backgroundColor:'transparent',
+    tooltip:{},
+    legend:[{data:cats.map(c=>c.name),textStyle:{color:'#e8f0fb'},top:0}],
+    series:[{
+      type:'graph', layout:'force', roam:true, draggable:true,
+      categories:cats,
+      data:nodes, links:links,
+      force:{repulsion:120, edgeLength:[40,140], gravity:0.08},
+      emphasis:{focus:'adjacency', lineStyle:{width:5}},
+      lineStyle:{color:'source',curveness:0.15},
+      label:{position:'right',color:'#cfd8e6',fontSize:11},
+      edgeSymbol:['none','arrow'], edgeSymbolSize:6,
+      scaleLimit:{min:0.3,max:4}
+    }]
+  });
+}
+window.addEventListener('resize',()=>{ if(gChart) gChart.resize(); });
+
+load();setInterval(()=>{load(); if(document.getElementById('page2').style.display!=='none') loadGraph();},30000);
 </script>
 </body>
 </html>"""
