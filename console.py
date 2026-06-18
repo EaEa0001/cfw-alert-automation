@@ -67,6 +67,14 @@ def api_realtime():
     return jsonify(stats.realtime_attention(_days()))
 
 
+@app.route("/api/asset_cards")
+def api_asset_cards():
+    return jsonify(stats.asset_cards(
+        _days(),
+        only_notable=request.args.get("all", "0") != "1",
+    ))
+
+
 @app.route("/api/attack_graph")
 def api_attack_graph():
     try:
@@ -430,6 +438,22 @@ SCREEN_PAGE = r"""<!doctype html>
   .gst{color:var(--fg);}
   .glegend select{background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:3px 6px;margin-left:4px;}
   .glegend label{display:inline-flex;align-items:center;gap:4px;}
+  .cardwall{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px;}
+  .acard{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--mut);
+         border-radius:12px;padding:14px 16px;}
+  .acard.b-高危{border-left-color:var(--hi);} .acard.b-关注{border-left-color:var(--warn);}
+  .acard .ah{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;}
+  .acard .aname{font-size:16px;font-weight:700;}
+  .acard .anum{color:var(--mut);font-size:13px;margin-bottom:10px;}
+  .acard .anum b{color:var(--fg);font-size:15px;}
+  .acard .alab{color:var(--mut);font-size:12px;margin:8px 0 4px;}
+  .acard .afoot{color:var(--mut);font-size:11px;margin-top:10px;text-align:right;}
+  .bd{padding:2px 9px;border-radius:10px;font-size:12px;}
+  .bd-hi{background:#3a1622;color:var(--hi);} .bd-wn{background:#3a3016;color:var(--warn);}
+  .chip{display:inline-block;background:#11161f;border:1px solid var(--line);border-radius:5px;
+        padding:2px 8px;margin:2px 5px 2px 0;font-size:12px;color:#cfd8e6;}
+  .chip.atk{font-family:Consolas,monospace;color:#ff9aab;}
+  .hi{color:var(--hi);}
 </style>
 </head>
 <body>
@@ -458,26 +482,13 @@ SCREEN_PAGE = r"""<!doctype html>
   <div class="panel"><h2>🪙 Token 用量</h2><div class="body"><table id="tokens"></table></div></div>
 </div>
 
-<div id="page2" style="display:none;height:calc(100vh - 60px);padding:14px 20px;">
+<div id="page2" style="display:none;height:calc(100vh - 60px);padding:14px 20px;overflow:auto;">
   <div class="glegend">
-    <span><i style="background:#ff5470"></i>公网攻击者</span>
-    <span><i style="background:#ffb547"></i>中转节点</span>
-    <span><i style="background:#3da9fc"></i>内网资产</span>
-    <label>资产
-      <select id="gtarget" onchange="loadGraph()"><option value="">全部资产</option></select>
-    </label>
-    <label>危险
-      <select id="gdanger" onchange="loadGraph()">
-        <option value="2" selected>仅高危</option>
-        <option value="1">高危+中危</option>
-        <option value="0">全部</option>
-      </select>
-    </label>
-    <label><input type="checkbox" id="gcollapse" checked onchange="loadGraph()">折叠零散扫描</label>
-    <span class="gst" id="gstats"></span>
-    <span style="margin-left:auto">点节点高亮其攻击关系</span>
+    <b style="color:var(--fg)">被攻击资产事件卡</b>
+    <label><input type="checkbox" id="cardall" onchange="loadCards()">显示全部资产(含零散)</label>
+    <span class="gst" id="cardstats"></span>
   </div>
-  <div id="graph" style="width:100%;height:calc(100% - 36px);"></div>
+  <div id="cards" class="cardwall"></div>
 </div>
 <script>
 let trendC,resultC;
@@ -554,62 +565,38 @@ async function load(){
   $('#upd').textContent='更新 '+new Date().toLocaleTimeString();
 }
 
-// ===== 第2页:攻击拓扑图 =====
-let gChart=null, gLoaded=false;
+// ===== 第2页:被攻击资产事件卡 =====
 function showPage(p){
   document.getElementById('page1').style.display = p===1?'':'none';
   document.getElementById('page2').style.display = p===2?'':'none';
   document.getElementById('tb1').classList.toggle('active',p===1);
   document.getElementById('tb2').classList.toggle('active',p===2);
-  if(p===2){ if(!gChart) gChart=echarts.init(document.getElementById('graph'),'dark'); loadGraph(); setTimeout(()=>gChart.resize(),50); }
+  if(p===2) loadCards();
 }
-let gTargetsLoaded=false;
-async function loadGraph(){
+async function loadCards(){
   const days=$('#days')?$('#days').value:7;
-  const md=$('#gdanger')?$('#gdanger').value:2;
-  const cl=($('#gcollapse')&&$('#gcollapse').checked)?1:0;
-  const tg=$('#gtarget')?$('#gtarget').value:'';
-  const g=await (await fetch(`/api/attack_graph?days=${days}&min_danger=${md}&collapse=${cl}&target=${encodeURIComponent(tg)}`)).json();
-  const st=g.stats||{};
-  // 填充资产下拉(只首次/换天时填,保留当前选择)
-  if(g.targets_list){
-    const sel=$('#gtarget'), cur=sel.value;
-    sel.innerHTML='<option value=\"\">全部资产</option>'+g.targets_list.map(t=>`<option value=\"${esc(t.ip)}\">${esc(t.name)} (${t.count})</option>`).join('');
-    sel.value=cur;
-  }
-  $('#gstats').textContent=`攻击者 ${st.attackers} · 中转 ${st.pivots} · 资产 ${st.targets} · 边 ${st.edges}`+(st.folded_solo?` · 已折叠零散 ${st.folded_solo}`:'');
-  const cats=[{name:'公网攻击者'},{name:'中转'},{name:'内网资产'}];
-  const nodes=g.nodes.map(n=>({
-    id:n.id, name:n.name, symbolSize:n.size,
-    category:cats.findIndex(c=>c.name===n.category),
-    itemStyle:{color:n.color},
-    label:{show:n.show_label!==false}
-  }));
-  const links=g.links.map(l=>({
-    source:l.source, target:l.target,
-    lineStyle:{color:l.color, width:Math.min(1+l.value*0.4,6), opacity:l.danger>=2?0.9:0.5, curveness:0.15},
-    tooltip:{formatter:`${l.source} → ${l.target}<br/>手法:${l.events}<br/>次数:${l.value}`}
-  }));
-  gChart.setOption({
-    backgroundColor:'transparent',
-    tooltip:{},
-    legend:[{data:cats.map(c=>c.name),textStyle:{color:'#e8f0fb'},top:0}],
-    series:[{
-      type:'graph', layout:'force', roam:true, draggable:true,
-      categories:cats,
-      data:nodes, links:links,
-      force:{repulsion:120, edgeLength:[40,140], gravity:0.08},
-      emphasis:{focus:'adjacency', lineStyle:{width:5}},
-      lineStyle:{color:'source',curveness:0.15},
-      label:{position:'right',color:'#cfd8e6',fontSize:11},
-      edgeSymbol:['none','arrow'], edgeSymbolSize:6,
-      scaleLimit:{min:0.3,max:4}
-    }]
-  });
+  const all=($('#cardall')&&$('#cardall').checked)?1:0;
+  const d=await (await fetch(`/api/asset_cards?days=${days}&all=${all}`)).json();
+  const tv=d.trivial||{};
+  $('#cardstats').textContent=`共 ${d.total_assets} 个资产被攻击，出卡 ${d.cards.length}`+(tv.assets?` · 另 ${tv.assets} 个零散扫描资产(${tv.count}次)已折叠`:'');
+  $('#cards').innerHTML = d.cards.map(c=>{
+    const evs=c.top_events.map(e=>`<span class="chip">${esc(e[0])} ×${e[1]}</span>`).join('');
+    const atk=c.top_attackers.map(a=>`<span class="chip atk">${esc(a[0])} ×${a[1]}</span>`).join('');
+    const badge = c.success? '<span class="bd bd-hi">⚠️已得手</span>' : (c.max_danger>=2?'<span class="bd bd-hi">高危手法</span>':(c.high?'<span class="bd bd-wn">含高危</span>':''));
+    return `<div class="acard b-${c.band}">
+      <div class="ah">
+        <div class="aname">${c.internal?'🏠':'🌐'} ${esc(c.name)}</div>
+        ${badge}
+      </div>
+      <div class="anum"><b>${c.count}</b> 次攻击 · <b>${c.attacker_count}</b> 个攻击源${c.success?` · <span class="hi">得手 ${c.success}</span>`:''}</div>
+      <div class="alab">攻击手法</div><div>${evs}</div>
+      <div class="alab">主要攻击源</div><div>${atk}</div>
+      <div class="afoot">最近 ${esc((c.last||'').slice(5,16))}</div>
+    </div>`;
+  }).join('') || '<div class="muted" style="padding:30px">✅ 暂无值得关注的被攻击资产</div>';
 }
-window.addEventListener('resize',()=>{ if(gChart) gChart.resize(); });
 
-load();setInterval(()=>{load(); if(document.getElementById('page2').style.display!=='none') loadGraph();},30000);
+load();setInterval(()=>{load(); if(document.getElementById('page2').style.display!=='none') loadCards();},30000);
 </script>
 </body>
 </html>"""

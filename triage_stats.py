@@ -248,6 +248,73 @@ def asset_rank(days=7, limit=12):
     return out[:limit]
 
 
+def asset_cards(days=7, only_notable=True, limit=40):
+    """按被攻击资产聚合成事件卡片(替代攻击拓扑图)。
+
+    每张卡:资产名/IP、被打次数、攻击者数、手法分布、是否得手、最高等级、TOP攻击者。
+    only_notable=True 只出"值得关注"的资产卡(高危手法/有得手/多攻击者),
+    其余零散扫描合并成一张汇总卡。
+    """
+    rows = load_judgements(days)
+    agg = {}
+    asset_name = {}
+    for r in rows:
+        # 资产名映射
+        for part in str(r.get("目标资产", "")).split("|"):
+            seg = part.split("/")
+            if len(seg) >= 4 and seg[3].strip():
+                asset_name[seg[3].strip()] = seg[1].strip() or seg[3].strip()
+        ev = r.get("事件名称", "")
+        danger = _danger_level(ev)
+        result = r.get("模型研判", "")
+        level = r.get("告警等级", "")
+        src = str(r.get("攻击IP", "")).split("|")[0].strip()
+        for dst in str(r.get("目标IP", "")).split("|"):
+            dst = dst.strip()
+            if not dst:
+                continue
+            g = agg.setdefault(dst, {"ip": dst, "count": 0, "attackers": {},
+                                     "events": {}, "max_danger": 0, "high": 0,
+                                     "success": 0, "last": ""})
+            g["count"] += 1
+            g["max_danger"] = max(g["max_danger"], danger)
+            if src:
+                g["attackers"][src] = g["attackers"].get(src, 0) + 1
+            if ev:
+                g["events"][ev] = g["events"].get(ev, 0) + 1
+            if level == "高危":
+                g["high"] += 1
+            if result == "确认成功":
+                g["success"] += 1
+            t = r.get("告警时间", "")
+            if t > g["last"]:
+                g["last"] = t
+
+    cards, trivial = [], {"assets": 0, "count": 0}
+    for dst, g in agg.items():
+        notable = (g["max_danger"] >= 2 or g["success"] > 0 or g["high"] > 0
+                   or len(g["attackers"]) >= 3 or g["count"] >= 5)
+        card = {
+            "ip": dst, "name": asset_name.get(dst, dst),
+            "internal": not _is_public(dst),
+            "count": g["count"], "attacker_count": len(g["attackers"]),
+            "high": g["high"], "success": g["success"], "max_danger": g["max_danger"],
+            "last": g["last"],
+            "top_events": sorted(g["events"].items(), key=lambda kv: -kv[1])[:5],
+            "top_attackers": sorted(g["attackers"].items(), key=lambda kv: -kv[1])[:5],
+            "band": "高危" if (g["success"] or g["max_danger"] >= 2) else ("关注" if g["high"] or len(g["attackers"]) >= 3 else "一般"),
+        }
+        if only_notable and not notable:
+            trivial["assets"] += 1
+            trivial["count"] += g["count"]
+            continue
+        cards.append(card)
+    # 排序:得手 > 高危手法 > 攻击者数 > 次数
+    cards.sort(key=lambda c: (c["success"], c["max_danger"], c["attacker_count"], c["count"]), reverse=True)
+    return {"cards": cards[:limit], "trivial": trivial,
+            "total_assets": len(agg)}
+
+
 def realtime_attention(days=2, limit=30):
     """需重点关注的实时列表:确认成功/需人工复核/高危。"""
     rows = load_judgements(days)
