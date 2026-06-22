@@ -866,17 +866,81 @@ def write_jsonl(path, rows):
             fh.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
+def recover_degraded_queue(config, dry_run=False, max_records=200):
+    """AI 重新接入成功后,自动对降级兜底的告警复判。
+
+    轻量、可频繁调度:
+      1. 队列为空 -> 直接返回(零成本 no-op)
+      2. 队列非空但 Codex 不可达 -> 返回 waiting,下次再来
+      3. 队列非空且 Codex 可达 -> 只对队列里的降级告警重跑深度研判,
+         判出真模型结果/可忽略的出队并处置,仍降级的留队列等下次。
+    """
+    import retry_queue
+    queued = retry_queue.queued_records(max_records=max_records)
+    result = {"mode": "recover_degraded", "dry_run": dry_run,
+              "queue_size": len(retry_queue.load_queue()), "rejudged": 0,
+              "resolved": 0, "still_degraded": 0, "ignored": 0,
+              "omit_actions": [], "status": "idle"}
+    if not queued:
+        result["status"] = "empty"
+        return result
+    # 队列非空,先确认 AI 真的回来了(精确预检)
+    if not monitor.codex_reachable(config):
+        result["status"] = "waiting_codex_unreachable"
+        return result
+
+    labels = whitelist_labels(config)
+    monitor._HOURLY_AGENT_MODE = False  # 复判不赶时间,允许 Agent 充分取证
+    judgements = deep_triage_records(config, queued, labels)
+    result["rejudged"] = len(judgements)
+
+    rec_by_id = {str(r.get("EventId") or r.get("AlertClusterId") or ""): r for r in queued}
+    high_ids = {eid for eid, r in rec_by_id.items()
+                if str(r.get("Level") or r.get("RiskLevel") or "") in ("High", "高危")}
+    ignore_ids, resolved, still = [], [], []
+    for eid, item in judgements.items():
+        if not eid:
+            continue
+        src = str(item.get("研判来源", ""))
+        if src.startswith("rule_fallback"):
+            still.append(eid)          # 还是降级,留队列
+            continue
+        resolved.append(eid)           # 判出真模型结果,出队
+        res = item.get("模型研判")
+        if res in IGNORE_RESULTS:
+            if eid in high_ids and (res not in ("确认未成功", "扫描探测")
+                                     or item.get("模型置信度") == "低"):
+                continue               # 高危存疑不忽略
+            ignore_ids.append(eid)
+    result["resolved"] = len(resolved)
+    result["still_degraded"] = len(still)
+    result["ignored"] = len(ignore_ids)
+
+    if not dry_run:
+        if ignore_ids:
+            result["omit_actions"] = omit_alert_center_events(config, ignore_ids)
+        # 出队:判出真结果的 + 已忽略的(都算已处置)
+        retry_queue.dequeue(set(resolved) | set(ignore_ids))
+    result["status"] = "recovered"
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description="Triage and dispose Tencent CFW alert center events.")
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--start")
     parser.add_argument("--end")
     parser.add_argument("--safe-hourly", action="store_true")
+    parser.add_argument("--recover", action="store_true",
+                        help="AI 重新接入后,对降级兜底队列复判(轻量,可频繁调度)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--limit", type=int)
     args = parser.parse_args()
 
     config = monitor.load_config()
+    if args.recover:
+        print(json.dumps(recover_degraded_queue(config, args.dry_run), ensure_ascii=False))
+        return
     if args.safe_hourly:
         end = args.end or monitor.dt_text(monitor.now_local())
         start = args.start or monitor.dt_text(monitor.now_local() - timedelta(hours=2))
