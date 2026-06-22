@@ -44,6 +44,90 @@ def fingerprint(src_ip, event_name, rule_id, direction=""):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
+# ================= 业务误报专用记忆 =================
+# 业务误报 = 自己人的正常业务流量被规则误命中,高度稳定、几乎不会变恶意,
+# 所以适合"记住→同类自动定误报"。指纹用"被误命中的业务特征",不含源IP
+# (误报可能来自任意客户端/扫描器,绑源IP会漏;绑业务接口才稳)。
+#   指纹 = 规则ID + 请求方法+URI路径(剥 host 和 query 参数)
+# 同一接口同一规则的误命中跨资产都能复用;接口路径比资产名稳定。
+
+BIZ_FP_PATH = os.path.join(DATA_DIR, "biz-fp-memory.jsonl")
+# 自动定误报的门槛:同指纹历史被判业务误报这么多次、且占比这么高,才允许命中即定
+BIZ_MIN_TIMES = 3
+BIZ_MIN_RATIO = 0.9
+
+
+def _req_path(req_line):
+    """从请求行 'POST /a/b?x=1 HTTP/1.1' 提取 '方法 /a/b'(去 query、去协议版本)。"""
+    parts = str(req_line or "").split()
+    if len(parts) < 2:
+        return ""
+    method, uri = parts[0], parts[1]
+    path = uri.split("?")[0].split("#")[0]
+    return "%s %s" % (method.upper(), path)
+
+
+def biz_fingerprint(rule_id, req_line):
+    """业务误报内容指纹 = 规则ID + 方法+路径(去host/去query)。"""
+    raw = "|".join([str(rule_id or ""), _req_path(req_line)])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _extract_req(record_or_row):
+    """从记录/研判行里取请求行(源包证据.req)。兼容 dict 与 CSV 字符串。"""
+    ev = (record_or_row.get("source_evidence") or record_or_row.get("源包证据")
+          or record_or_row.get("e") or {})
+    if isinstance(ev, str):
+        try:
+            import ast
+            ev = ast.literal_eval(ev)
+        except Exception:
+            ev = {}
+    if isinstance(ev, dict):
+        return ev.get("req") or ""
+    return ""
+
+
+def remember_biz_fp(rule_id, req_line, result, asset="", recorded_at=None):
+    """落一条业务误报内容记忆(只在能取到请求路径时才记,否则指纹无意义)。"""
+    path = _req_path(req_line)
+    if not path or not rule_id:
+        return None
+    fp = biz_fingerprint(rule_id, req_line)
+    _append_jsonl(BIZ_FP_PATH, {
+        "bfp": fp, "rule_id": str(rule_id), "path": path,
+        "result": result, "asset": asset,
+        "at": recorded_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    return fp
+
+
+def biz_fp_verdict(rule_id, req_line, days=90):
+    """业务误报记忆命中判定。返回:
+      None        -> 未命中/证据不足,照常研判
+      dict(命中)   -> {'hit':True,'times':n,'ratio':r,'path':..} 可直接定业务误报
+    门槛:同指纹历史被判业务误报 >= BIZ_MIN_TIMES 次且占比 >= BIZ_MIN_RATIO。"""
+    path = _req_path(req_line)
+    if not path or not rule_id:
+        return None
+    fp = biz_fingerprint(rule_id, req_line)
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    total = biz = 0
+    for rec in _read_jsonl(BIZ_FP_PATH):
+        if rec.get("bfp") != fp or rec.get("at", "") < cutoff:
+            continue
+        total += 1
+        if rec.get("result") == "业务误报":
+            biz += 1
+    if total < BIZ_MIN_TIMES:
+        return None
+    ratio = biz / total
+    if ratio < BIZ_MIN_RATIO:
+        return None
+    return {"hit": True, "times": biz, "total": total,
+            "ratio": round(ratio, 3), "path": path, "bfp": fp}
+
+
 def _read_jsonl(path):
     if not os.path.exists(path):
         return

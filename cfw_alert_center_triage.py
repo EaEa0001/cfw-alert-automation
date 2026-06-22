@@ -509,12 +509,58 @@ def deep_triage_records(config, records, labels):
     """
     model = (config.get("llm") or {}).get("model", "gpt-5.5")
     rows = [record_to_judge_row(record, labels, config) for record in records]
-    judgements = monitor.llm_judge_rows(config, rows)
+
+    # 业务误报记忆短路:命中"同接口+同规则历史一贯业务误报"的,直接定业务误报,
+    # 不进 LLM(省 token)。高危不短路(即便命中也让模型复核,安全优先)。
     by_event = {}
+    llm_rows = []
+    mem_hit = 0
+    try:
+        import triage_memory
+    except Exception:
+        triage_memory = None
     for row in rows:
+        if triage_memory and row.get("告警等级") != "高危":
+            req = triage_memory._extract_req(row)
+            verdict = triage_memory.biz_fp_verdict(row.get("规则ID", ""), req) if req else None
+            if verdict:
+                by_event[row["告警ID"]] = {
+                    "告警ID": row["告警ID"], "攻击IP": row.get("攻击IP", ""),
+                    "模型研判": "业务误报", "模型置信度": "高",
+                    "研判理由": "记忆短路:该接口+规则近90天%d/%d次均判业务误报"
+                                % (verdict["times"], verdict["total"]),
+                    "关键证据": verdict["path"], "下一步": "自动忽略",
+                    "研判来源": "memory_biz_fp", "研判模型": "memory",
+                    "输入Token": "0", "输出Token": "0", "推理Token": "0",
+                }
+                mem_hit += 1
+                continue
+        llm_rows.append(row)
+
+    if mem_hit:
+        print(json.dumps({"biz_fp_memory_shortcut": mem_hit,
+                          "sent_to_llm": len(llm_rows)}, ensure_ascii=False))
+
+    judgements = monitor.llm_judge_rows(config, llm_rows)
+    for row in llm_rows:
         item = judgements.get(row["告警ID"])
         if item:
             by_event[row["告警ID"]] = item
+
+    # 写回业务误报内容记忆:本轮判为业务误报的(无论来自模型还是短路),沉淀指纹
+    if triage_memory:
+        for row in rows:
+            item = by_event.get(row["告警ID"])
+            if item and item.get("模型研判") == "业务误报" \
+                    and item.get("研判来源") != "memory_biz_fp":
+                req = triage_memory._extract_req(row)
+                if req:
+                    try:
+                        triage_memory.remember_biz_fp(
+                            row.get("规则ID", ""), req, "业务误报",
+                            asset=row.get("目标资产", ""))
+                    except Exception:
+                        pass
     return by_event
 
 
@@ -974,7 +1020,53 @@ def main():
     white_rows = [row for row in rows if row["_white_hits"]]
     llm_rows = [row for row in rows if not row["_white_hits"]]
     judgements = {row["告警ID"]: deterministic_white_judgement(row, model) for row in white_rows}
+
+    # 业务误报记忆短路(与 deep_triage_records 同口径):命中即定业务误报,跳过 LLM。
+    try:
+        import triage_memory
+    except Exception:
+        triage_memory = None
+    if triage_memory:
+        remaining = []
+        biz_hit = 0
+        for row in llm_rows:
+            if row.get("告警等级") != "高危":
+                req = triage_memory._extract_req(row)
+                verdict = triage_memory.biz_fp_verdict(row.get("规则ID", ""), req) if req else None
+                if verdict:
+                    judgements[row["告警ID"]] = {
+                        "告警ID": row["告警ID"], "攻击IP": row.get("攻击IP", ""),
+                        "模型研判": "业务误报", "模型置信度": "高",
+                        "研判理由": "记忆短路:该接口+规则近90天%d/%d次均判业务误报"
+                                    % (verdict["times"], verdict["total"]),
+                        "关键证据": verdict["path"], "下一步": "自动忽略",
+                        "研判来源": "memory_biz_fp", "研判模型": "memory",
+                        "输入Token": "0", "输出Token": "0", "推理Token": "0",
+                    }
+                    biz_hit += 1
+                    continue
+            remaining.append(row)
+        if biz_hit:
+            print(json.dumps({"biz_fp_memory_shortcut": biz_hit,
+                              "sent_to_llm": len(remaining)}, ensure_ascii=False))
+        llm_rows = remaining
+
     judgements.update(monitor.llm_judge_rows(config, llm_rows))
+
+    # 写回业务误报内容记忆(本轮模型判为业务误报的)
+    if triage_memory:
+        for row in rows:
+            item = judgements.get(row["告警ID"])
+            if item and item.get("模型研判") == "业务误报" \
+                    and item.get("研判来源") != "memory_biz_fp":
+                req = triage_memory._extract_req(row)
+                if req:
+                    try:
+                        triage_memory.remember_biz_fp(
+                            row.get("规则ID", ""), req, "业务误报",
+                            asset=row.get("目标资产", ""))
+                    except Exception:
+                        pass
 
     judged_rows = apply_judgements(rows, judgements)
     # 高危更严:仅当模型明确判"确认未成功/扫描探测"且置信非低才忽略;"未见成功证据"
