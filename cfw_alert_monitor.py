@@ -1638,6 +1638,19 @@ def compact_direct_row(row, index):
             compact["desc"] = str(row.get("威胁描述"))[:160]
         if row.get("云防火墙建议"):
             compact["suggest"] = str(row.get("云防火墙建议"))[:120]
+        # 记忆先验:同源IP+事件+规则的历史结论分布(命中才带,模型仍可推翻)
+        try:
+            import triage_memory
+            h = triage_memory.lookup(
+                row.get("攻击IP") or row.get("源IP") or "",
+                row.get("事件名称") or "", row.get("规则ID") or "", days=30, max_hits=8)
+            if h:
+                from collections import Counter
+                dist = Counter(x["result"] for x in h if x.get("result"))
+                if dist:
+                    compact["hist"] = {k: v for k, v in dist.most_common(3)}
+        except Exception:
+            pass
         # 把已抓到的源包证据(含主动拉取的 HTTP 请求/响应)带进首轮研判,
         # 否则模型看不到包,只能按聚合字段判“无源包”。
         evidence = row.get("源包证据")
@@ -1817,6 +1830,8 @@ def codex_direct_prompt(batch, id_map):
             "resp为404/403/401或WAF阻断→确认未成功;有利用请求但响应非成功且无回显→未见成功证据;"
             "纯扫描器特征→扫描探测;有真实包但证据矛盾或确实高危且无法定论→需人工复核。"
             "单独HTTP 200、普通页面、ETag、哈希样字符串不算成功证据。"
+            "字段hist=该源IP+事件+规则近30天历史研判结论分布(仅作先验参考),"
+            "若本次证据与历史一致可增强信心,若本次证据不同以本次证据为准,不要盲从历史。"
         )
     else:
         task = (
@@ -2844,6 +2859,16 @@ def llm_judge_rows(config, rows):
                         "输出Token": str((usage or {}).get("output_tokens", "")),
                         "推理Token": str((usage or {}).get("reasoning_output_tokens", "")),
                     }
+                    # 写回记忆库(只存真模型结果,降级兜底不污染先验)
+                    try:
+                        import triage_memory
+                        triage_memory.remember(
+                            (row.get("攻击IP") or row.get("源IP") or "",
+                             row.get("事件名称") or "", row.get("规则ID") or "",
+                             row.get("方向") or ""),
+                            results[key])
+                    except Exception:
+                        pass
                 else:
                     results[key] = fallback_judgement(row, "rule_fallback_model_parse_error", model)
             # 整批 miss 说明该批次解析失败/返回空,记日志使其在控制台可见,
