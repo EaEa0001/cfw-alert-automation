@@ -1125,21 +1125,27 @@ def _netflow_logs_for_record(config, record, start_text, end_text, limit=None):
         source_cfg = (config.get("llm") or {}).get("source_review") or {}
         limit = int(source_cfg.get("netflow_fetch_limit", 100))
 
-    # netflow_nta 的 DescribeLogs 只对整点对齐的时间窗返回数据,带分秒的边界
-    # (如 08:48:50)会返回 Total=0。把窗口 start 下取整、end 上取整到整点。
-    def _align(text, ceil):
+    # netflow_nta 的 DescribeLogs 有个强约束:StartTime 必须是当天 00:00:00,
+    # 否则(哪怕整点对齐如 10:00:00)一律返回 Total=0。实测:00-16 命中、10-16 为 0。
+    # 故 start 一律下取整到当天零点;end 上取整到整点(并保证 >= start 当天)。
+    def _day_start(text):
+        try:
+            dt = datetime.strptime(str(text), "%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            return text
+        return dt_text(dt.replace(hour=0, minute=0, second=0))
+
+    def _ceil_hour(text):
         try:
             dt = datetime.strptime(str(text), "%Y-%m-%d %H:%M:%S")
         except (TypeError, ValueError):
             return text
         if dt.minute or dt.second:
-            dt = dt.replace(minute=0, second=0)
-            if ceil:
-                dt += timedelta(hours=1)
+            dt = dt.replace(minute=0, second=0) + timedelta(hours=1)
         return dt_text(dt)
 
-    start_text = _align(start_text, ceil=False)
-    end_text = _align(end_text, ceil=True)
+    start_text = _day_start(start_text)
+    end_text = _ceil_hour(end_text)
 
     client = build_client(config)
     out = []
