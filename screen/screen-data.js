@@ -35,6 +35,8 @@
       },
       deltas: { total: "", auto: "", manual: "", success: "" },
       results: ov.results || {},
+      sources: ov.sources || {},
+      tokensBySource: ov.tokens_by_source || {},
       tokens: {
         input: k.input || 0, output: k.output || 0,
         reasoning: k.reasoning || 0, total: k.total || 0,
@@ -131,14 +133,59 @@
     level: a.level, event: a.event, src: a.atkIp, res: a.result,
   }));
 
+  // 真实漏斗:全部由 overview.sources / total / retained 派生,无硬编码占位
+  function buildFunnel(ov) {
+    ov = ov || {};
+    const s = ov.sources || {};
+    const total = ov.total || 0;
+    const retained = ov.retained || (ov.results || {})["需人工复核"] || 0;
+    return [
+      { key: "noise", label: "入库告警(已剔除扫描噪声)", n: total, tone: "primary",
+        note: "告警中心未处置告警,已排除腾讯云暴露面扫描与公司漏扫源" },
+      { key: "l1", label: "第 1 层 · 规则/单轮过筛", n: s["单轮"] || 0, tone: "ok",
+        note: "纯扫描器特征 / 源包失败,单轮即定性" },
+      { key: "l2", label: "第 2 层 · 源包深度复核", n: s["源包复核"] || 0, tone: "warn",
+        note: "主动拉取源数据包,基于真实 HTTP 包给结论" },
+      { key: "l3", label: "第 3 层 · Agent 工具循环", n: s["Agent"] || 0, tone: "danger",
+        note: "高危/复杂,模型自主取证(只读)多轮研判" },
+      { key: "degraded", label: "降级兜底(连接/解析异常)", n: s["降级兜底"] || 0, tone: "warn",
+        note: "Codex 不可用时按规则降级,入重试队列待补判" },
+      { key: "keep", label: "保留人工复核", n: retained, tone: "danger",
+        note: "需人工复核 + 确认成功" },
+    ];
+  }
+
+  // 计算 delta(本期 vs 上一等长周期)
+  function pct(cur, prev) {
+    if (!prev) return cur ? "+100%" : "0%";
+    const d = (cur - prev) / prev * 100;
+    return (d >= 0 ? "+" : "") + d.toFixed(1) + "%";
+  }
+
   // 拉取某时间窗的全部数据并覆盖 CFW.DEMO
   async function load(days) {
-    const [ov, tr, hp, ar, sr, rt, al, pf] = await Promise.all([
+    const [ov, tr, hp, ar, sr, rt, al, pf, ovPrev] = await Promise.all([
       API("overview", days), API("trend", days), API("health", days),
       API("attacker_rank", days), API("asset_rank", days),
       API("realtime", days), API("alerts", days + "&limit=300"), API("profiles", days),
+      API("overview", days * 2),  // 用 2 倍窗口减去本期,近似上一等长周期
     ]);
     const win = mapWindow(ov, tr, ({ 1: "今天", 3: "近 3 天", 7: "近 7 天" }[days] || days + " 天"));
+    // 真实 delta:上一周期 = (2N窗口) - (N窗口)
+    if (ov && ovPrev) {
+      const pr = {
+        total: (ovPrev.total || 0) - (ov.total || 0),
+        auto: (ovPrev.auto_ignored || 0) - (ov.auto_ignored || 0),
+        manual: ((ovPrev.results || {})["需人工复核"] || 0) - ((ov.results || {})["需人工复核"] || 0),
+        success: ((ovPrev.results || {})["确认成功"] || 0) - ((ov.results || {})["确认成功"] || 0),
+      };
+      win.deltas = {
+        total: pct(ov.total || 0, pr.total),
+        auto: pct(ov.auto_ignored || 0, pr.auto),
+        manual: pct((ov.results || {})["需人工复核"] || 0, pr.manual),
+        success: "+" + ((ov.results || {})["确认成功"] || 0),
+      };
+    }
     CFW.DEMO.windows[days] = win;
     CFW.DEMO.health = mapHealth(hp);
     CFW.DEMO.attackerRank = mapAttackerRank(ar);
@@ -147,13 +194,13 @@
     CFW.DEMO.alerts = mapAlerts(al);
     const pmapped = mapProfiles(pf);
     if (pmapped.length) CFW.DEMO.profiles = pmapped;
+    else CFW.DEMO.profiles = [];  // 无画像数据则留空,不显示 demo 兜底
     CFW.DEMO.tickerPool = mapTicker(CFW.DEMO.alerts);
-    // funnel 顶层用真实总量校准(其余分层用派生说明)
-    if (ov && CFW.DEMO.funnel && CFW.DEMO.funnel.length) {
-      CFW.DEMO.funnel = CFW.DEMO.funnel.map(f =>
-        f.key === "noise" ? Object.assign({}, f, { n: ov.total || f.n }) :
-        f.key === "keep" ? Object.assign({}, f, { n: ov.retained || f.n }) :
-        f.key === "l3" ? Object.assign({}, f, { n: (ov.sources || {})["Agent"] || f.n }) : f);
+    CFW.DEMO.funnel = buildFunnel(ov);  // 全真实派生
+    // 效能视图"近7天累计成效"固定读 windows[7],确保它也是真实值
+    if (days !== 7) {
+      const [ov7, tr7] = await Promise.all([API("overview", 7), API("trend", 7)]);
+      CFW.DEMO.windows[7] = mapWindow(ov7, tr7, "近 7 天");
     }
     // 去掉 DEMO 角标
     const badge = document.querySelector(".demo-badge");

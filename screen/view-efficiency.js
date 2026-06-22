@@ -10,12 +10,15 @@
     const manualH = Math.round(k.total * MIN_PER_ALERT / 60);
     const perAlert = Math.round(t.total / k.total);
 
-    const srcSplit = [
-      { k: "源包复核", pct: 41, color: "var(--primary)" },
-      { k: "单轮研判", pct: 38, color: "var(--text-dim)" },
-      { k: "Agent 循环", pct: 19, color: "var(--violet)" },
-      { k: "降级兜底", pct: 2, color: "var(--danger)" }
-    ].map(s => ({ ...s, val: Math.round(t.total * s.pct / 100) }));
+    // 真实 token 拆分:来自 overview.tokens_by_source(每来源 in+out+reason)
+    const tbs = w.tokensBySource || {};
+    const tok = name => { const x = tbs[name] || {}; return (x.in || 0) + (x.out || 0) + (x.reason || 0); };
+    const colorMap = { "源包复核": "var(--primary)", "单轮": "var(--text-dim)", "Agent": "var(--violet)", "降级兜底": "var(--danger)" };
+    const labelMap = { "源包复核": "源包复核", "单轮": "单轮研判", "Agent": "Agent 循环", "降级兜底": "降级兜底" };
+    const srcSplit = ["源包复核", "单轮", "Agent", "降级兜底"].map(name => {
+      const val = tok(name);
+      return { k: labelMap[name], color: colorMap[name], val, pct: t.total ? Math.round(val / t.total * 100) : 0 };
+    });
 
     root.innerHTML = `
       <div class="panel value-banner">

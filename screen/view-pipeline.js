@@ -10,7 +10,7 @@
     const fn = CFW.DEMO.funnel;
     const intake = fn.filter(s => s.key === "raw" || s.key === "noise");
     const bands = fn.filter(s => !["raw", "noise"].includes(s.key));
-    const maxN = 3847;
+    const maxN = Math.max(1, ...bands.map(s => s.n || 0));
 
     root.innerHTML = `
       <div class="panel">
