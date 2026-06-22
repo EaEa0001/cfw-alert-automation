@@ -11,6 +11,10 @@
     const intake = fn.filter(s => s.key === "raw" || s.key === "noise");
     const bands = fn.filter(s => !["raw", "noise"].includes(s.key));
     const maxN = Math.max(1, ...bands.map(s => s.n || 0));
+    const w = CFW.win();
+    const totalN = (intake[0] && intake[0].n) || 0;
+    const keepN = (bands.find(s => s.key === "keep") || {}).n || 0;
+    const ignoreRate = (w.kpi && w.kpi.ignoreRate) || 0;
 
     root.innerHTML = `
       <div class="panel">
@@ -28,7 +32,7 @@
 
       <div class="grid mt" style="grid-template-columns:1.6fr 1fr">
         <div class="panel">
-          <h2>三层漏斗研判 <span class="hint">入库告警 ${fmt(maxN)} 条 → 保留人工 30 条</span></h2>
+          <h2>分层研判 <span class="hint">入库告警 ${fmt(totalN)} 条 → 保留人工 ${fmt(keepN)} 条</span></h2>
 
           <div class="intake">
             ${intake.map((s, i) => `<div class="intake-cell">
@@ -58,8 +62,8 @@
         <div class="panel">
           <h2>这套漏斗为什么有效</h2>
           <div class="why-big">
-            <div class="why-num mono">99.2<span>%</span></div>
-            <div class="why-cap">告警被自动定性 / 处置<br>仅 <b style="color:var(--warn)">0.8%</b> 需要人工研判</div>
+            <div class="why-num mono">${ignoreRate.toFixed(1)}<span>%</span></div>
+            <div class="why-cap">告警被自动定性 / 处置<br>仅 <b style="color:var(--warn)">${(100 - ignoreRate).toFixed(1)}%</b> 需要人工研判</div>
           </div>
           <div class="why-list">
             <div class="why-i"><span class="dot" style="background:var(--ok)"></span><div><b>越早越省</b><div class="mut">第 0/1 层用规则与白名单直接定性，几乎不耗 token。</div></div></div>

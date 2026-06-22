@@ -138,10 +138,14 @@
     ov = ov || {};
     const s = ov.sources || {};
     const total = ov.total || 0;
+    const auto = ov.auto_ignored || 0;
     const retained = ov.retained || (ov.results || {})["需人工复核"] || 0;
     return [
-      { key: "noise", label: "入库告警(已剔除扫描噪声)", n: total, tone: "primary",
-        note: "告警中心未处置告警,已排除腾讯云暴露面扫描与公司漏扫源" },
+      // intake 两格(raw=入库总量 / noise=自动处置后),view 的 .intake 需要两格
+      { key: "raw", label: "入库告警", n: total, tone: "primary",
+        note: "告警中心未处置告警(已排除腾讯云暴露面扫描与公司漏扫源)" },
+      { key: "noise", label: "自动处置", n: auto, tone: "primary", drop: "保留人工",
+        note: "确认未成功 / 扫描探测 / 未见成功证据 → 自动忽略加白" },
       { key: "l1", label: "第 1 层 · 规则/单轮过筛", n: s["单轮"] || 0, tone: "ok",
         note: "纯扫描器特征 / 源包失败,单轮即定性" },
       { key: "l2", label: "第 2 层 · 源包深度复核", n: s["源包复核"] || 0, tone: "warn",
@@ -201,6 +205,13 @@
     if (days !== 7) {
       const [ov7, tr7] = await Promise.all([API("overview", 7), API("trend", 7)]);
       CFW.DEMO.windows[7] = mapWindow(ov7, tr7, "近 7 天");
+    }
+    // 侧栏"告警研判台"徽章 = 真实需人工复核条数
+    const tb = document.getElementById("triageBadge");
+    if (tb) {
+      const manual = (ov && (ov.results || {})["需人工复核"]) || 0;
+      tb.textContent = manual;
+      tb.style.display = manual ? "" : "none";
     }
     // 去掉 DEMO 角标
     const badge = document.querySelector(".demo-badge");
