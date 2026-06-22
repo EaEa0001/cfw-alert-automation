@@ -642,12 +642,16 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
                 result = item.get("模型研判")
                 if result not in IGNORE_RESULTS:
                     continue
-                # 高危更严:必须模型明确判"确认未成功/扫描探测"(明确无害),
-                # 且置信不为低,才允许忽略;"未见成功证据"这种存疑结论不忽略高危,留人工。
+                # 高危更严:必须模型明确判无害结论 且置信不为低,才允许忽略。
+                # 允许的无害结论:确认未成功 / 扫描探测 / 业务误报(后者须有真实源包支撑,
+                # 即基于原包看到正常业务响应而非臆测)。"未见成功证据"存疑,仍留人工。
                 if event_id in high_ids:
-                    if result not in ("确认未成功", "扫描探测"):
+                    if result not in ("确认未成功", "扫描探测", "业务误报"):
                         continue
                     if item.get("模型置信度") == "低":
+                        continue
+                    # 业务误报对高危额外要求:必须有真实源包证据(防臆测放行)
+                    if result == "业务误报" and not (item.get("关键证据") or item.get("源包证据")):
                         continue
                 deep_ignore_ids.append(event_id)
             ignore_ids = ignore_ids + deep_ignore_ids
@@ -1076,9 +1080,12 @@ def main():
         if result not in IGNORE_RESULTS or not row.get("告警ID"):
             return False
         if row.get("告警等级") == "高危":
-            if result not in ("确认未成功", "扫描探测"):
+            # 高危可忽略的无害结论:确认未成功/扫描探测/业务误报(后者须有源包支撑)
+            if result not in ("确认未成功", "扫描探测", "业务误报"):
                 return False
             if row.get("模型置信度") == "低":
+                return False
+            if result == "业务误报" and not (row.get("关键证据") or row.get("源包证据")):
                 return False
         return True
 
