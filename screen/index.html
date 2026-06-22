@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CFW 安全运营中心</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="views.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<div class="app">
+
+  <!-- ===== Sidebar ===== -->
+  <aside class="side">
+    <div class="brand">
+      <div class="mark" id="brandMark"></div>
+      <div>
+        <div class="name">CFW 安全运营中心</div>
+        <div class="sub">云防火墙告警自动研判平台</div>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <div class="lbl">监控</div>
+      <div class="nav-item active" data-view="overview"><span data-ic="grid"></span><span class="t">态势总览</span></div>
+      <div class="nav-item" data-view="triage"><span data-ic="list"></span><span class="t">告警研判台</span><span class="badge">28</span></div>
+      <div class="nav-item" data-view="attackers"><span data-ic="target"></span><span class="t">攻击者画像</span></div>
+      <div class="lbl">体系</div>
+      <div class="nav-item" data-view="pipeline"><span data-ic="flow"></span><span class="t">研判流水线</span></div>
+      <div class="nav-item" data-view="efficiency"><span data-ic="chart"></span><span class="t">效能与成本</span></div>
+    </nav>
+
+    <div class="side-foot">
+      <div class="flex"><span data-ic="shield" style="width:14px;color:var(--primary)"></span> codex_direct · gpt-5.5</div>
+      <div class="row"><span class="dot live"></span> 小时任务运行中 · 不自动封禁</div>
+    </div>
+  </aside>
+
+  <!-- ===== Main ===== -->
+  <div class="main">
+    <header class="topbar">
+      <div>
+        <h1 id="topTitle">态势总览</h1>
+        <div class="crumb" id="topCrumb"></div>
+      </div>
+      <div class="spacer"></div>
+      <span class="demo-badge">示例数据 DEMO</span>
+      <div class="segmented" id="daySeg">
+        <button class="active" data-d="1">今天</button>
+        <button data-d="3">近 3 天</button>
+        <button data-d="7">近 7 天</button>
+      </div>
+      <div style="text-align:right">
+        <div class="clock" id="clock"></div>
+        <div class="updated" id="updated"></div>
+      </div>
+    </header>
+
+    <main class="content">
+      <section class="view active" id="view-overview"></section>
+      <section class="view" id="view-triage"></section>
+      <section class="view" id="view-attackers"></section>
+      <section class="view" id="view-pipeline"></section>
+      <section class="view" id="view-efficiency"></section>
+    </main>
+  </div>
+</div>
+
+<script src="core.js"></script>
+<script src="icons.js"></script>
+<script src="view-overview.js"></script>
+<script src="view-pipeline.js"></script>
+<script src="view-triage.js"></script>
+<script src="view-attackers.js"></script>
+<script src="view-efficiency.js"></script>
+<script src="screen-data.js"></script>
+<script src="app.js"></script>
+<script>
+  // 注入侧栏图标
+  document.querySelectorAll("[data-ic]").forEach(s => { s.innerHTML = CFW.ICON[s.dataset.ic] || ""; });
+  document.getElementById("brandMark").innerHTML = CFW.ICON.shield;
+  CFW.init();
+</script>
+</body>
+</html>
