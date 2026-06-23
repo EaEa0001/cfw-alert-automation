@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
-"""研判记忆库 —— 让研判越用越省、越用越准,并沉淀金标准。
+"""研判记忆库 —— 让研判越用越省、越用越准。
 
-三件事:
+两件事:
   1) 写入:每次研判后,把 (指纹, 结论, 置信, 来源, 时间) 落库
   2) 检索:研判前按指纹/源IP查历史结论,作为"先验"喂给模型(模型仍可推翻)
-  3) 金标准:凡是被人工处置过的(忽略/确认),沉淀成带标注的金标准样本,供 eval 回测
 
 指纹设计(host/时间/告警ID 无关,这些会变):
     src_ip(归一) + 事件名 + 规则ID + 方向
@@ -12,7 +11,6 @@
 
 存储:JSONL,无数据库。
   data/triage-memory.jsonl   每条研判记忆
-  data/golden-set.jsonl      人工确认过结论的金标准样本
 """
 import hashlib
 import json
@@ -22,7 +20,6 @@ from datetime import datetime, timedelta
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(ROOT, "data")
 MEMORY_PATH = os.path.join(DATA_DIR, "triage-memory.jsonl")
-GOLDEN_PATH = os.path.join(DATA_DIR, "golden-set.jsonl")
 
 # 可忽略类(自动处置)与需保留类,用于判断"人工最终怎么处置"
 IGNORE_RESULTS = {"确认未成功", "扫描探测", "未见成功证据", "业务误报"}
@@ -210,36 +207,12 @@ def prior_hint(src_ip, event_name, rule_id, direction="", days=30):
             "若本次证据与历史不符以本次为准。" % (days, len(hits), top, n, len(hits)))
 
 
-# ---------- 金标准沉淀 ----------
-def record_golden(record_fields, final_result, label_source="human_disposition",
-                  recorded_at=None):
-    """沉淀一条金标准样本(人工最终处置/确认的结论)。
-    final_result: 人工最终认定的类别。label_source: 标注来源(human_disposition / manual_tag)。"""
-    src_ip, event, rule_id, direction = (list(record_fields) + ["", "", "", ""])[:4]
-    _append_jsonl(GOLDEN_PATH, {
-        "fp": fingerprint(src_ip, event, rule_id, direction),
-        "src_ip": _norm_ip(src_ip),
-        "event": event,
-        "rule_id": rule_id,
-        "label": final_result,           # 金标准答案
-        "label_source": label_source,
-        "at": recorded_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    })
-
-
-def golden_set(days=90):
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-    return [g for g in _read_jsonl(GOLDEN_PATH) if g.get("at", "") >= cutoff]
-
-
 def stats():
     mem = list(_read_jsonl(MEMORY_PATH))
-    gold = list(_read_jsonl(GOLDEN_PATH))
     fps = {m.get("fp") for m in mem}
     return {
         "memory_records": len(mem),
         "distinct_fingerprints": len(fps),
-        "golden_samples": len(gold),
     }
 
 
