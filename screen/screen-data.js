@@ -62,6 +62,9 @@
       llmErrors: h.errors_total || 0,
       agentCount: h.agent_count || h.agentCount || 0,
       retryQueue: h.retry_queue || h.retryQueue || 0,
+      evidenceHitCount: h.evidence_hit || h.evidenceHitCount || 0,
+      degraded: h.degraded || 0,
+      total: h.total || 0,
       errorsByType: ebt,
     };
   }
@@ -85,14 +88,49 @@
   }));
 
   // ---- /api/alerts(中文键) -> alerts(英文键) ----
-  const mapAlerts = arr => (arr || []).map(a => ({
-    time: a["告警时间"] || "", level: a["告警等级"] || "",
-    event: a["事件名称"] || "", atkIp: String(a["攻击IP"] || "").split("|")[0],
-    dstIp: String(a["目标IP"] || "").split("|")[0], result: a["模型研判"] || "",
-    source: a["研判来源"] || "", evidenceFrom: a["证据来源"] || "",
-    conf: a["模型置信度"] || a["置信度"] || "", token: a["token"] || a["Token"] || 0,
-    why: a["研判理由"] || "", key: a["关键证据"] || "", trace: a["工具轨迹"] || "",
-  }));
+  const mapAlerts = arr => (arr || []).map(a => {
+    const atk = String(a["攻击IP"] || "");
+    const dst = String(a["目标IP"] || "");
+    return {
+      id: a["告警ID"] || "",
+      date: a["日期"] || "",
+      time: a["告警时间"] || "",
+      level: a["告警等级"] || "",
+      event: a["事件名称"] || "",
+      atkIp: atk.split("|")[0],
+      atkIps: atk,
+      srcIp: a["源IP"] || atk,
+      dstIp: dst.split("|")[0],
+      dstIps: dst,
+      dstAsset: a["目标资产"] || "",
+      direction: a["方向"] || "",
+      threatType: a["威胁类型"] || "",
+      country: a["来源国家"] || "",
+      ruleId: a["规则ID"] || "",
+      strategy: a["策略"] || "",
+      desc: a["威胁描述"] || "",
+      cloudAdvice: a["云防火墙建议"] || "",
+      localAdvice: a["本地建议"] || "",
+      whiteState: a["白名单状态"] || "",
+      result: a["模型研判"] || "",
+      source: a["研判来源"] || "",
+      sourceRaw: a["研判来源原始"] || "",
+      model: a["研判模型"] || "",
+      evidenceFrom: a["证据来源"] || "",
+      evidenceHit: a["源包命中"] || "",
+      sourceEvidence: a["源包证据"] || "",
+      conf: a["模型置信度"] || a["置信度"] || "",
+      token: a["token"] || a["Token"] || 0,
+      tokenIn: a["输入Token"] || 0,
+      tokenOut: a["输出Token"] || 0,
+      tokenReason: a["推理Token"] || 0,
+      why: a["研判理由"] || "",
+      key: a["关键证据"] || "",
+      next: a["下一步"] || "",
+      trace: a["工具轨迹"] || "",
+      raw: a,
+    };
+  });
 
   // ---- /api/profiles(triage_stats 扁平结构) -> 视图字段 ----
   const bandOf = (b, score) => {
@@ -110,8 +148,8 @@
       country: p.country || (p.internal ? "内网" : ""),
       type: p.attacker_type || p.type || "未分类",
       intent: p.intent || "—",
-      stage: p.stage || p.killchain_max || "侦察",
-      killchainMax: p.killchain_max || p.stage || "侦察",
+      stage: p.stage || p.killchain_max || "探测",
+      killchainMax: p.killchain_max || p.stage || "探测",
       narrative: p.narrative || "(暂无 AI 叙述,运行 attacker_profile.py 生成)",
       score: score,
       band: bandOf(p.band, score),
@@ -168,10 +206,12 @@
 
   // 拉取某时间窗的全部数据并覆盖 CFW.DEMO
   async function load(days) {
-    const [ov, tr, hp, ar, sr, rt, al, pf, ovPrev] = await Promise.all([
+    const [ov, tr, hp, ar, sr, rt, al, pf, ps, ag, rules, whitelist, agentAlerts, ovPrev] = await Promise.all([
       API("overview", days), API("trend", days), API("health", days),
       API("attacker_rank", days), API("asset_rank", days),
       API("realtime", days), API("alerts", days + "&limit=300"), API("profiles", days),
+      API("pipeline", days),
+      API("agent/config", days), API("agent/rules", days), API("agent/whitelist", days), API("agent/alerts", days + "&limit=80"),
       API("overview", days * 2),  // 用 2 倍窗口减去本期,近似上一等长周期
     ]);
     const win = mapWindow(ov, tr, ({ 1: "今天", 3: "近 3 天", 7: "近 7 天" }[days] || days + " 天"));
@@ -201,6 +241,11 @@
     else CFW.DEMO.profiles = [];  // 无画像数据则留空,不显示 demo 兜底
     CFW.DEMO.tickerPool = mapTicker(CFW.DEMO.alerts);
     CFW.DEMO.funnel = buildFunnel(ov);  // 全真实派生
+    CFW.DEMO.pipelineStatus = ps || {};
+    CFW.DEMO.agent = ag || { model_routing: { routes: {}, providers: {} }, provider_health: {}, agent: {} };
+    CFW.DEMO.customRules = rules || [];
+    CFW.DEMO.whitelistConfig = whitelist || { tencent_scan_ips: [], company_scan_ips: [], whitelist_ips: [], counts: {} };
+    CFW.DEMO.agentAlerts = Array.isArray(agentAlerts) ? agentAlerts : [];
     // 效能视图"近7天累计成效"固定读 windows[7],确保它也是真实值
     if (days !== 7) {
       const [ov7, tr7] = await Promise.all([API("overview", 7), API("trend", 7)]);

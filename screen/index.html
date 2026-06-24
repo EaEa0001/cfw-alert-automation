@@ -4,11 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CFW 安全运营中心</title>
+<link rel="icon" href="data:,">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="styles.css">
-<link rel="stylesheet" href="views.css">
+<link rel="stylesheet" href="styles.css?v=20260624-rule-center3">
+<link rel="stylesheet" href="views.css?v=20260624-rule-center3">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -29,9 +30,11 @@
       <div class="nav-item active" data-view="overview"><span data-ic="grid"></span><span class="t">态势总览</span></div>
       <div class="nav-item" data-view="triage"><span data-ic="list"></span><span class="t">告警研判台</span><span class="badge" id="triageBadge">—</span></div>
       <div class="nav-item" data-view="attackers"><span data-ic="target"></span><span class="t">攻击者画像</span></div>
+      <div class="nav-item" data-view="reports"><span data-ic="report"></span><span class="t">日报周报</span></div>
       <div class="lbl">体系</div>
       <div class="nav-item" data-view="pipeline"><span data-ic="flow"></span><span class="t">研判流水线</span></div>
-      <div class="nav-item" data-view="efficiency"><span data-ic="chart"></span><span class="t">效能与成本</span></div>
+      <div class="nav-item" data-view="lists"><span data-ic="filter"></span><span class="t">自定义规则</span></div>
+      <div class="nav-item" data-view="agent"><span data-ic="shield"></span><span class="t">Agent 配置</span></div>
     </nav>
 
     <div class="side-foot">
@@ -65,20 +68,24 @@
       <section class="view" id="view-triage"></section>
       <section class="view" id="view-attackers"></section>
       <section class="view" id="view-pipeline"></section>
-      <section class="view" id="view-efficiency"></section>
+      <section class="view" id="view-lists"></section>
+      <section class="view" id="view-agent"></section>
+      <section class="view" id="view-reports"></section>
     </main>
   </div>
 </div>
 
-<script src="core.js"></script>
-<script src="icons.js"></script>
-<script src="view-overview.js"></script>
-<script src="view-pipeline.js"></script>
-<script src="view-triage.js"></script>
-<script src="view-attackers.js"></script>
-<script src="view-efficiency.js"></script>
-<script src="screen-data.js"></script>
-<script src="app.js"></script>
+<script src="core.js?v=20260624-rule-center3"></script>
+<script src="icons.js?v=20260624-rule-center3"></script>
+<script src="view-overview.js?v=20260624-rule-center3"></script>
+<script src="view-pipeline.js?v=20260624-rule-center3"></script>
+<script src="view-triage.js?v=20260624-rule-center3"></script>
+<script src="view-attackers.js?v=20260624-rule-center3"></script>
+<script src="view-lists.js?v=20260624-rule-center3"></script>
+<script src="view-agent.js?v=20260624-rule-center3"></script>
+<script src="view-reports.js?v=20260624-rule-center3"></script>
+<script src="screen-data.js?v=20260624-rule-center3"></script>
+<script src="app.js?v=20260624-rule-center3"></script>
 <script>
   // 注入侧栏图标
   document.querySelectorAll("[data-ic]").forEach(s => { s.innerHTML = CFW.ICON[s.dataset.ic] || ""; });

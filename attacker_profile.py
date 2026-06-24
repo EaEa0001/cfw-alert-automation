@@ -1,7 +1,7 @@
 """攻击者画像 —— 从逐条告警升级到"按攻击者维度"的研判。
 
 把一段时间窗内告警中心的全部告警按攻击源 IP 聚合,算出攻击序列/手法多样性/
-杀伤链阶段/是否得手,再把聚合结果(及关键源包)喂模型做画像级研判:攻击者类型、
+攻击阶段/是否得手,再把聚合结果(及关键源包)喂模型做画像级研判:攻击者类型、
 意图、攻击叙事、当前阶段、画像威胁评分、处置建议。高危画像推企微。
 
 复用 cfw_alert_monitor 的 Codex 调用、源包抓取与企微发送,不依赖数据库。
@@ -21,8 +21,30 @@ import cfw_alert_monitor as monitor
 import cfw_alert_center_triage as triage
 
 
-# 杀伤链阶段排序(用于判断攻击者推进到哪一步)
-KILLCHAIN_ORDER = ["侦察扫描", "漏洞利用", "横向移动", "命令控制", "数据窃取", "影响破坏"]
+# 攻击阶段排序(用于判断攻击者推进到哪一步)
+KILLCHAIN_ORDER = ["探测", "尝试利用", "成功利用", "落地驻留", "控制回连", "横向扩散", "外传/破坏"]
+KILLCHAIN_ALIASES = {
+    "侦察": "探测",
+    "侦察扫描": "探测",
+    "扫描探测": "探测",
+    "漏洞利用": "尝试利用",
+    "利用": "尝试利用",
+    "利用尝试": "尝试利用",
+    "已利用": "成功利用",
+    "利用成功": "成功利用",
+    "安装": "落地驻留",
+    "落地": "落地驻留",
+    "落地执行": "落地驻留",
+    "命令控制": "控制回连",
+    "控制": "控制回连",
+    "横向": "横向扩散",
+    "横向移动": "横向扩散",
+    "数据窃取": "外传/破坏",
+    "影响破坏": "外传/破坏",
+    "外传破坏": "外传/破坏",
+    "数据/破坏": "外传/破坏",
+    "行动": "外传/破坏",
+}
 
 
 def _is_internal(ip):
@@ -43,7 +65,7 @@ def aggregate_attackers(config, days):
     attackers = []
     for ip, recs in by_ip.items():
         events = [str(r.get("EventName") or "") for r in recs]
-        kill = [str(r.get("KillChain") or "") for r in recs if r.get("KillChain")]
+        kill = [_stage_label(r.get("KillChain")) for r in recs if r.get("KillChain")]
         dst = set()
         for r in recs:
             dst.update(str(x) for x in (r.get("DstIpList") or []))
@@ -102,6 +124,11 @@ def _max_stage(kill_list):
     return best
 
 
+def _stage_label(value):
+    value = str(value or "").strip()
+    return KILLCHAIN_ALIASES.get(value, value)
+
+
 def rule_score(a):
     """规则画像评分 0-100:手法多样性 + 针对性 + 阶段 + 是否得手。"""
     score = 0
@@ -141,7 +168,7 @@ def build_profile_prompt(a):
         "告警总数": a["alert_count"],
         "手法种类": a["technique_kinds"],
         "手法序列": [f"{name}x{cnt}" for name, cnt in seq][:12],
-        "杀伤链阶段": a["killchain"],
+        "攻击阶段": a["killchain"],
         "已达最深阶段": a["killchain_max"],
         "目标资产数": a["target_count"],
         "高危告警数": a["high"],
@@ -156,12 +183,12 @@ def build_profile_prompt(a):
         "只输出一个紧凑JSON对象,字段:"
         "attacker_type(自动化扫描器/脚本小子/有目标的攻击者/疑似APT/内部异常/正常业务误报),"
         "intent(攻击意图,≤30汉字),"
-        "stage(当前杀伤链阶段判断,取:侦察/利用尝试/已利用/横向/控制/窃取/无),"
+        "stage(当前攻击阶段判断,取:探测、尝试利用、成功利用、落地驻留、控制回连、横向扩散、外传/破坏、无),"
         "narrative(攻击叙事,用1-2句话讲清这个IP先做了什么再做了什么有没有得手,≤80汉字),"
         "threat_score(0-100整数),"
         "recommendation(处置建议,取:封禁/重点监控/继续观察/忽略,可加简短理由,≤25汉字)。"
         "判断依据:手法越多样越集中越像有目标攻击者;纯单一扫描特征是扫描器;"
-        "有云端成功、木马通信(njRAT等)、命令回显或已达横向/控制阶段则威胁高。"
+        "有云端成功、木马通信(njRAT等)、命令回显或已达横向扩散/控制回连阶段则威胁高。"
         "内网源研判分级(关键,避免把正常业务误画成攻击者):"
         "①若手法序列含木马通信(njRAT)/webshell/反弹回连,或云端标记成功数>0 → 真实威胁,"
         "判'内部异常',threat_score≥70,recommendation='封禁'或'重点监控'(这条优先级最高,样本即使正常也按此判);"
@@ -247,7 +274,7 @@ def profile_card(a, profile):
         f"> **{a['ip']}**  ({src})",
         f"- 画像威胁评分:**{profile.get('threat_score', 0)}**  规则分 {a['_rule_score']} · {a['_band']}",
         f"- 攻击意图:{profile.get('intent', '-')}",
-        f"- 当前阶段:**{profile.get('stage', '-')}**(杀伤链最深 {a['killchain_max'] or '-'})",
+            f"- 当前阶段:**{profile.get('stage', '-')}**(攻击阶段最深 {a['killchain_max'] or '-'})",
         f"- 攻击叙事:{profile.get('narrative', '-')}",
         f"- 手法序列:{seq_text}",
         f"- 规模:{a['alert_count']} 次告警 / {a['technique_kinds']} 种手法 / {a['target_count']} 个目标 / 跨度 {a['span_hours']}h",

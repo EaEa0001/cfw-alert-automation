@@ -323,3 +323,119 @@ td.r { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .detail .dl { color: var(--primary); }
 .detail .ev { color: var(--warn); }
+
+/* ============================================================
+   Responsive shell
+   ============================================================ */
+@media (max-width: 760px) {
+  body { overflow-x: hidden; }
+  .app {
+    grid-template-columns: 1fr;
+  }
+  .side {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .brand {
+    padding: 14px 16px 12px;
+  }
+  .brand .mark {
+    width: 34px;
+    height: 34px;
+  }
+  .nav {
+    padding: 8px;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+  }
+  .nav .lbl {
+    grid-column: 1 / -1;
+    padding: 8px 8px 2px;
+  }
+  .nav-item {
+    min-width: 0;
+    padding: 9px 10px;
+  }
+  .nav-item .t {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .side-foot {
+    display: none;
+  }
+  .topbar {
+    height: auto;
+    min-height: 64px;
+    padding: 12px 14px;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+  .topbar h1,
+  .topbar .crumb {
+    white-space: normal;
+  }
+  .topbar h1 {
+    font-size: 16px;
+  }
+  .topbar .crumb {
+    font-size: 12px;
+  }
+  .spacer {
+    display: none;
+  }
+  .segmented {
+    order: 3;
+    width: 100%;
+  }
+  .segmented button {
+    flex: 1 1 0;
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+  .clock,
+  .updated {
+    font-size: 11.5px;
+  }
+  .content {
+    padding: 14px 12px 28px;
+  }
+  .g-4,
+  .g-3,
+  .g-2 {
+    grid-template-columns: 1fr;
+  }
+  .span-2,
+  .span-3 {
+    grid-column: auto;
+  }
+  .panel {
+    padding: 14px 12px;
+    overflow-x: auto;
+  }
+  .panel > h2 {
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+  .panel > h2 .hint {
+    width: 100%;
+    margin-left: 0;
+  }
+  .kpi {
+    min-height: 108px;
+  }
+  .kpi .k-num {
+    font-size: 32px;
+  }
+  .tick-row {
+    grid-template-columns: 54px 48px minmax(0, 1fr);
+  }
+  .tick-row > :last-child {
+    grid-column: 3;
+  }
+  table {
+    min-width: 560px;
+  }
+}

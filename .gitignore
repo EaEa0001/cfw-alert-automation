@@ -1,4 +1,5 @@
 # Local runtime configuration and credentials
+/.private-tccli/
 /config.json
 .env
 .env.*

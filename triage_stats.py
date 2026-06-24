@@ -16,6 +16,41 @@ REPORT_DIR = ROOT / "reports"
 LOG_DIR = ROOT / "logs"
 
 RESULT_ORDER = ["确认成功", "需人工复核", "未见成功证据", "确认未成功", "扫描探测"]
+PROFILE_NO_SUCCESS_RESULTS = {"确认未成功", "未见成功证据", "扫描探测", "业务误报"}
+PROFILE_STAGE_ALIASES = {
+    "": "",
+    "无": "",
+    "侦察": "探测",
+    "侦察扫描": "探测",
+    "扫描探测": "探测",
+    "武器化": "尝试利用",
+    "投递": "尝试利用",
+    "利用": "尝试利用",
+    "漏洞利用": "尝试利用",
+    "利用尝试": "尝试利用",
+    "尝试利用": "尝试利用",
+    "已利用": "成功利用",
+    "利用成功": "成功利用",
+    "成功利用": "成功利用",
+    "安装": "落地驻留",
+    "落地": "落地驻留",
+    "落地执行": "落地驻留",
+    "落地驻留": "落地驻留",
+    "控制": "控制回连",
+    "命令控制": "控制回连",
+    "控制回连": "控制回连",
+    "横向": "横向扩散",
+    "横向移动": "横向扩散",
+    "横向扩散": "横向扩散",
+    "窃取": "外传/破坏",
+    "数据窃取": "外传/破坏",
+    "数据外传": "外传/破坏",
+    "影响破坏": "外传/破坏",
+    "外传破坏": "外传/破坏",
+    "数据/破坏": "外传/破坏",
+    "行动": "外传/破坏",
+    "外传/破坏": "外传/破坏",
+}
 SOURCE_LABEL = {
     "codex_direct": "单轮",
     "codex_direct_source": "源包复核",
@@ -33,6 +68,10 @@ def source_label(value):
     return value or "未知"
 
 
+def profile_stage_label(value, default="探测"):
+    return PROFILE_STAGE_ALIASES.get(str(value or "").strip(), str(value or "").strip() or default)
+
+
 def _read_jsonl(path):
     rows = []
     try:
@@ -47,6 +86,14 @@ def _read_jsonl(path):
     except OSError:
         pass
     return rows
+
+
+def _read_json_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def _parse_time(value):
@@ -171,23 +218,16 @@ def alerts(days=7, level=None, result=None, source=None, limit=300):
             continue
         if source and source_label(r.get("研判来源", "")) != source:
             continue
-        out.append({
-            "告警ID": r.get("告警ID", ""),
-            "告警时间": r.get("告警时间", ""),
-            "攻击IP": r.get("攻击IP", ""),
-            "目标IP": r.get("目标IP", ""),
-            "告警等级": r.get("告警等级", ""),
-            "事件名称": r.get("事件名称", ""),
-            "模型研判": r.get("模型研判", ""),
-            "模型置信度": r.get("模型置信度", ""),
-            "研判理由": r.get("研判理由", ""),
-            "关键证据": r.get("关键证据", ""),
-            "证据来源": r.get("证据来源", ""),
-            "研判来源": source_label(r.get("研判来源", "")),
-            "工具轨迹": r.get("工具轨迹", ""),
-            "源包证据": r.get("源包证据", ""),
-            "Token": _to_int(r.get("输入Token")) + _to_int(r.get("输出Token")) + _to_int(r.get("推理Token")),
-        })
+        row = dict(r)
+        row.pop("_at", None)
+        row.pop("_file_dt", None)
+        row["研判来源原始"] = r.get("研判来源", "")
+        row["研判来源"] = source_label(r.get("研判来源", ""))
+        row["输入Token"] = _to_int(r.get("输入Token"))
+        row["输出Token"] = _to_int(r.get("输出Token"))
+        row["推理Token"] = _to_int(r.get("推理Token"))
+        row["Token"] = row["输入Token"] + row["输出Token"] + row["推理Token"]
+        out.append(row)
     out.sort(key=lambda x: x["告警时间"], reverse=True)
     return out[:limit]
 
@@ -569,6 +609,187 @@ def health(days=7):
     }
 
 
+def pipeline_status(days=7, config=None, limit=12):
+    """Aggregate realtime polling, disposition, and notification state for the pipeline view."""
+    cutoff = datetime.now() - timedelta(days=days)
+    config = config or {}
+    realtime_cfg = config.get("realtime_triage") or {}
+    wecom_cfg = config.get("wecom") or {}
+    agent_cfg = config.get("agent") or {}
+    llm_cfg = config.get("llm") or {}
+
+    rounds = []
+    for path in sorted(glob.glob(str(DATA_DIR / "realtime-poll-*.jsonl"))):
+        for rec in _read_jsonl(path):
+            at = _parse_time(rec.get("recorded_at") or rec.get("query_end"))
+            if at and at < cutoff:
+                continue
+            item = _pipeline_round(rec, at)
+            if item:
+                rounds.append(item)
+    rounds.sort(key=lambda x: x.get("_at") or datetime.min, reverse=True)
+
+    recent = rounds[:limit]
+    last_round = _strip_private(recent[0]) if recent else {}
+    active_round = next((r for r in recent if _to_int(r.get("alert_count")) or _to_int(r.get("new_records"))), None)
+    active_round = _strip_private(active_round) if active_round else last_round
+
+    totals = {
+        "rounds": len(rounds),
+        "dry_runs": sum(1 for r in rounds if r.get("dry_run")),
+        "query_total": sum(_to_int(r.get("query_total")) for r in rounds),
+        "new_records": sum(_to_int(r.get("new_records")) for r in rounds),
+        "alert_count": sum(_to_int(r.get("alert_count")) for r in rounds),
+        "ignored": sum(_to_int(r.get("ignore_event_ids")) for r in rounds),
+        "manual_candidates": sum(_to_int(r.get("manual_candidates")) for r in rounds),
+        "manual_pending_push": sum(_to_int(r.get("manual_pending_push")) for r in rounds),
+        "custom_rule_hits": sum(_to_int(r.get("custom_rule_hits")) for r in rounds),
+        "whitelist_hit_events": sum(_to_int(r.get("whitelist_hit_events")) for r in rounds),
+        "push_sent": sum(1 for r in rounds if (r.get("manual_push") or {}).get("sent")),
+        "push_failed": sum(1 for r in rounds if _push_failed(r.get("manual_push") or {})),
+        "action_failed": sum(_action_failed_count(r) for r in rounds),
+    }
+
+    latest_wecom = _latest_jsonl_record(DATA_DIR / f"wecom-notify-{datetime.now().strftime('%Y-%m-%d')}.jsonl", cutoff)
+    if not latest_wecom:
+        latest_wecom = _latest_jsonl_record(DATA_DIR / f"wecom-notify-{(datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')}.jsonl", cutoff)
+
+    disposition = _latest_json_report("cfw_realtime_disposition_*.json", cutoff)
+    disposition_round = _pipeline_round(
+        disposition,
+        _parse_time(disposition.get("recorded_at") or disposition.get("query_end")),
+    ) if disposition else {}
+    state_file = Path(realtime_cfg.get("state_file") or DATA_DIR / "realtime-poll-state.json")
+    if not state_file.is_absolute():
+        state_file = ROOT / state_file
+    state = _read_json_file(state_file)
+
+    return {
+        "config": {
+            "realtime_enabled": bool(realtime_cfg.get("enabled", False)),
+            "interval_seconds": _to_int(realtime_cfg.get("interval_seconds")) or 60,
+            "lookback_minutes": _to_int(realtime_cfg.get("lookback_minutes")) or 10,
+            "max_records_per_round": _to_int(realtime_cfg.get("max_records_per_round")) or 80,
+            "auto_dispose": bool(realtime_cfg.get("auto_dispose", True)),
+            "push_manual": bool(realtime_cfg.get("push_manual", True)),
+            "manual_notify_cooldown_minutes": _to_int(realtime_cfg.get("manual_notify_cooldown_minutes")) or 240,
+            "daily_report_time": wecom_cfg.get("daily_report_time") or "17:50",
+            "hourly_report_enabled": bool(wecom_cfg.get("hourly_enabled", False)),
+            "daily_report_enabled": bool(wecom_cfg.get("daily_enabled", True)),
+            "manual_push_enabled": bool(wecom_cfg.get("manual_enabled", True)),
+            "agent_enabled": bool(agent_cfg.get("enabled", False)),
+            "model": llm_cfg.get("model", ""),
+        },
+        "last_round": last_round,
+        "active_round": active_round,
+        "recent_rounds": [_strip_private(r) for r in recent],
+        "totals": totals,
+        "state": {
+            "processed": len(state.get("processed") or {}),
+            "manual_notified": len(state.get("manual_notified") or {}),
+            "state_file_exists": state_file.exists(),
+        },
+        "latest_disposition": _strip_private(disposition_round),
+        "latest_wecom": _sanitize_wecom(latest_wecom),
+    }
+
+
+def _pipeline_round(rec, at=None):
+    manual_push = rec.get("manual_push") if isinstance(rec.get("manual_push"), dict) else {}
+    judgement_counts = rec.get("judgement_counts") if isinstance(rec.get("judgement_counts"), dict) else {}
+    return {
+        "_at": at or _parse_time(rec.get("recorded_at") or rec.get("query_end")),
+        "recorded_at": rec.get("recorded_at") or rec.get("query_end", ""),
+        "mode": rec.get("mode", ""),
+        "dry_run": bool(rec.get("dry_run", False)),
+        "query_start": rec.get("query_start", ""),
+        "query_end": rec.get("query_end", ""),
+        "query_total": _to_int(rec.get("query_total")),
+        "active_before": _to_int(rec.get("active_before")),
+        "new_records": _to_int(rec.get("new_records")),
+        "dedup_removed": _to_int(rec.get("dedup_removed")),
+        "alert_count": _to_int(rec.get("alert_count")),
+        "ignore_event_ids": _to_int(rec.get("ignore_event_ids")),
+        "manual_candidates": _to_int(rec.get("manual_candidates")),
+        "manual_pending_push": _to_int(rec.get("manual_pending_push")),
+        "custom_rule_hits": _to_int(rec.get("custom_rule_hits")),
+        "whitelist_hit_events": _to_int(rec.get("whitelist_hit_events")),
+        "judgement_counts": {str(k): _to_int(v) for k, v in judgement_counts.items()},
+        "manual_push": {
+            "sent": bool(manual_push.get("sent", False)),
+            "reason": manual_push.get("reason", ""),
+            "error": str(manual_push.get("error", ""))[:160],
+        },
+        "white_actions_count": len(rec.get("white_actions") or []),
+        "omit_actions_count": len(rec.get("omit_actions") or []),
+        "action_failed": _action_failed_count(rec),
+        "disposition_file": os.path.basename(str(rec.get("disposition_file") or "")),
+        "judgement_jsonl": os.path.basename(str(rec.get("judgement_jsonl") or "")),
+    }
+
+
+def _strip_private(item):
+    if not item:
+        return {}
+    out = dict(item)
+    out.pop("_at", None)
+    return out
+
+
+def _action_failed_count(rec):
+    failed = 0
+    for action in (rec.get("white_actions") or []) + (rec.get("omit_actions") or []):
+        if action.get("error") or action.get("return_code") not in (None, 0, "0"):
+            failed += 1
+    return failed
+
+
+def _push_failed(push):
+    if not push:
+        return False
+    if push.get("sent"):
+        return False
+    return bool(push.get("error")) or str(push.get("reason") or "") not in ("", "dry_run", "no_manual_items")
+
+
+def _latest_jsonl_record(path, cutoff):
+    rows = []
+    for rec in _read_jsonl(path):
+        at = _parse_time(rec.get("recorded_at") or rec.get("time"))
+        if at and at >= cutoff:
+            rows.append((at, rec))
+    rows.sort(key=lambda x: x[0], reverse=True)
+    return rows[0][1] if rows else {}
+
+
+def _latest_json_report(pattern, cutoff):
+    latest = None
+    latest_at = None
+    for path in glob.glob(str(REPORT_DIR / pattern)):
+        rec = _read_json_file(path)
+        at = _parse_time(rec.get("query_end") or rec.get("recorded_at"))
+        if at and at < cutoff:
+            continue
+        if at and (latest_at is None or at > latest_at):
+            latest_at = at
+            latest = dict(rec, disposition_file=os.path.basename(path))
+    return latest or {}
+
+
+def _sanitize_wecom(rec):
+    if not rec:
+        return {}
+    reason = str(rec.get("reason") or rec.get("error") or "")
+    reason = reason.split(",", 1)[0]
+    return {
+        "recorded_at": rec.get("recorded_at", ""),
+        "type": rec.get("type", ""),
+        "enabled": bool(rec.get("enabled", False)),
+        "sent": bool(rec.get("sent", False)),
+        "reason": reason[:80],
+    }
+
+
 def profiles(days=7, limit=50):
     """读取最近 N 天的攻击者画像(每次运行落一条 summary,取并集后按评分去重)。"""
     cutoff = datetime.now() - timedelta(days=days)
@@ -600,7 +821,7 @@ def profiles(days=7, limit=50):
             "country": p.get("country", ""),
             "attacker_type": pr.get("attacker_type", ""),
             "intent": pr.get("intent", ""),
-            "stage": pr.get("stage", ""),
+            "stage": profile_stage_label(pr.get("stage", "")),
             "narrative": pr.get("narrative", ""),
             "score": pr.get("final_score", p.get("rule_score", 0)),
             "rule_score": p.get("rule_score", 0),
@@ -609,7 +830,7 @@ def profiles(days=7, limit=50):
             "alert_count": p.get("alert_count", 0),
             "technique_kinds": p.get("technique_kinds", 0),
             "target_count": p.get("target_count", 0),
-            "killchain_max": p.get("killchain_max", ""),
+            "killchain_max": profile_stage_label(p.get("killchain_max", "")),
             "high": p.get("high", 0),
             "cloud_success": p.get("cloud_success", 0),
             "span_hours": p.get("span_hours", 0),
@@ -619,7 +840,167 @@ def profiles(days=7, limit=50):
             "targets": p.get("targets", []),
             "run_at": p.get("_run_at", ""),
         })
-    return flat
+    return flat or _fallback_profiles_from_judgements(days, limit=limit)
+
+
+def _country_for_ip(row, ip):
+    for part in str(row.get("来源国家") or "").split("|"):
+        if part.startswith(str(ip) + ":"):
+            return part.split(":", 1)[1]
+    return ""
+
+
+def _fallback_profiles_from_judgements(days=7, limit=50):
+    """Build rule-based attacker cards when attacker_profile.py has not run yet."""
+    rows = load_judgements(days)
+    agg = {}
+    for row in rows:
+        src_ips = [x.strip() for x in str(row.get("攻击IP") or "").split("|") if x.strip()]
+        dst_ips = [x.strip() for x in str(row.get("目标IP") or "").split("|") if x.strip()]
+        event = row.get("事件名称", "")
+        result = row.get("模型研判", "")
+        level = row.get("告警等级", "")
+        at = row.get("告警时间", "")
+        for ip in src_ips:
+            g = agg.setdefault(ip, {
+                "ip": ip,
+                "internal": not _is_public(ip),
+                "country": _country_for_ip(row, ip),
+                "alert_count": 0,
+                "events": Counter(),
+                "targets": set(),
+                "results": Counter(),
+                "high": 0,
+                "cloud_success": 0,
+                "first_seen": at,
+                "last_seen": at,
+                "max_danger": 0,
+            })
+            if not g["country"]:
+                g["country"] = _country_for_ip(row, ip)
+            g["alert_count"] += 1
+            if event:
+                g["events"][event] += 1
+                g["max_danger"] = max(g["max_danger"], _danger_level(event))
+            for dst in dst_ips:
+                g["targets"].add(dst)
+            if result:
+                g["results"][result] += 1
+            if level == "高危":
+                g["high"] += 1
+            if result == "确认成功":
+                g["cloud_success"] += 1
+            if at and (not g["first_seen"] or at < g["first_seen"]):
+                g["first_seen"] = at
+            if at and at > g["last_seen"]:
+                g["last_seen"] = at
+
+    out = []
+    for g in agg.values():
+        technique_kinds = len(g["events"])
+        target_count = len(g["targets"])
+        success = g["cloud_success"]
+        manual = g["results"].get("需人工复核", 0)
+        unknown = g["results"].get("未见成功证据", 0)
+        scan = g["results"].get("扫描探测", 0)
+        false_positive = g["results"].get("业务误报", 0)
+        safe_count = sum(g["results"].get(k, 0) for k in PROFILE_NO_SUCCESS_RESULTS)
+        all_no_success = (
+            success == 0
+            and manual == 0
+            and g["high"] == 0
+            and g["alert_count"] > 0
+            and safe_count >= g["alert_count"]
+        )
+        base_score = (
+            10
+            + min(g["alert_count"] * 2, 18)
+            + min(technique_kinds * 5, 35)
+            + min(target_count * 4, 20)
+        )
+        risk_bonus = g["high"] * 16 + success * 35 + manual * 14
+        if all_no_success:
+            if unknown or g["results"].get("确认未成功", 0):
+                risk_bonus += min(g["max_danger"] * 4, 8)
+        else:
+            risk_bonus += g["max_danger"] * 8
+        score = min(100, base_score + risk_bonus)
+        if all_no_success:
+            if scan + false_positive >= max(1, g["alert_count"] // 2):
+                score = min(score, 34)
+            elif g["max_danger"] >= 2 or technique_kinds >= 4 or g["alert_count"] >= 5:
+                score = min(score, 45)
+            else:
+                score = min(score, 39)
+        if success or (not all_no_success and score >= 70):
+            band = "高危"
+        elif manual or unknown or score >= 40:
+            band = "关注"
+        else:
+            band = "一般"
+        if success:
+            attacker_type = "疑似成功攻击源"
+            intent = "利用并落地"
+            stage = "成功利用"
+            killchain_stage = "成功利用"
+            recommendation = "立即核查目标资产日志和落地痕迹"
+        elif all_no_success and (g["max_danger"] >= 2 or unknown):
+            attacker_type = "漏洞利用尝试源"
+            intent = "尝试利用暴露服务,未见落地证据"
+            stage = "尝试利用"
+            killchain_stage = "尝试利用"
+            recommendation = "持续观察并保留证据,无成功证据时不按高危攻击者处置"
+        elif g["max_danger"] >= 2 or manual:
+            attacker_type = "漏洞利用攻击源"
+            intent = "尝试利用暴露服务"
+            stage = "尝试利用"
+            killchain_stage = "尝试利用"
+            recommendation = "优先复核源包、目标服务日志和同源历史行为"
+        elif scan >= max(1, g["alert_count"] // 2):
+            attacker_type = "扫描探测源"
+            intent = "资产探测与漏洞枚举"
+            stage = "探测"
+            killchain_stage = "探测"
+            recommendation = "保持自动忽略,如命中受控扫描源可加入规则"
+        else:
+            attacker_type = "低频攻击源"
+            intent = "失败尝试"
+            stage = "尝试利用"
+            killchain_stage = "尝试利用"
+            recommendation = "持续观察,出现高危或成功证据时升级处理"
+        top_event = g["events"].most_common(1)[0][0] if g["events"] else "未知事件"
+        narrative = f"{g['ip']} 在窗口内触发 {g['alert_count']} 条告警,主要为 {top_event},覆盖 {target_count} 个目标,当前结论以 {g['results'].most_common(1)[0][0] if g['results'] else '未知'} 为主。"
+        first = _parse_time(g["first_seen"])
+        last = _parse_time(g["last_seen"])
+        span = round((last - first).total_seconds() / 3600, 1) if first and last and last >= first else 0
+        out.append({
+            "ip": g["ip"],
+            "internal": g["internal"],
+            "country": g["country"],
+            "attacker_type": attacker_type,
+            "intent": intent,
+            "stage": stage,
+            "narrative": narrative,
+            "score": score,
+            "rule_score": score,
+            "band": band,
+            "recommendation": recommendation,
+            "alert_count": g["alert_count"],
+            "technique_kinds": technique_kinds,
+            "target_count": target_count,
+            "killchain_max": killchain_stage,
+            "high": g["high"],
+            "cloud_success": success,
+            "span_hours": span,
+            "first_seen": g["first_seen"],
+            "last_seen": g["last_seen"],
+            "events": dict(g["events"]),
+            "targets": sorted(g["targets"]),
+            "run_at": "rule_fallback",
+            "profile_source": "rule_fallback",
+        })
+    out.sort(key=lambda p: (p["score"], p["alert_count"], p["technique_kinds"]), reverse=True)
+    return out[:limit]
 
 
 def full_report(days=7):

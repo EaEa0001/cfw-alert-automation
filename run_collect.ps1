@@ -14,7 +14,7 @@ $ExitCode = 1
 try {
     $Process = Start-Process `
         -FilePath "python" `
-        -ArgumentList @((Join-Path $Root "cfw_alert_monitor.py"), "collect", "--lookback-hours", "1") `
+        -ArgumentList @((Join-Path $Root "cfw_alert_monitor.py"), "collect", "--lookback-hours", "1", "--skip-triage") `
         -NoNewWindow `
         -Wait `
         -PassThru `

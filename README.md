@@ -1,40 +1,101 @@
-# Tencent Cloud Firewall Alert Automation
+# 云火哨兵 · CFW SOC Agent
 
-腾讯云云防火墙告警采集、研判、自动忽略和企微通知工具。
+面向腾讯云防火墙的本地 SOC Agent。项目从“告警采集脚本”升级为“实时轮询、证据增强研判、人工研判台、自定义规则和多模型路由”的安全运营工具。
 
-项目运行、架构和问题清单见 [项目报告](docs/reports/project-status-2026-06-12.md)。
+## 当前能力
 
-## 工作流程
+- 实时轮询腾讯云告警中心未处理事件，默认每 60 秒回看最近 10 分钟。
+- 对新 `EventId` 立即研判，自动忽略确认无害项，把需要人工确认的告警推送到企业微信。
+- 保留每天 17:50 日报，小时报默认关闭。
+- 支持攻击者画像、告警研判台、研判流水线、自定义规则、Agent 配置、日报周报等本地 SOC 页面。
+- 支持 Codex 订阅、Codex/OpenAI API、Claude API、Claude Code、本地 CLI、DeepSeek、GLM 等模型路由。
+- 支持自然语言生成自定义规则，例如“事件编号 xxx 是正常业务，以后同源同目标同规则不研判”。
+- 支持自然语言封禁草案；真正调用腾讯云黑名单接口需要二次确认。
 
-1. 每小时拉取上一小时全流量检测与响应日志。
-2. 排除腾讯云暴露面扫描 IP 和公司漏扫 IP。
-3. 三层漏斗研判:
-   - 第 0 层(确定性):白名单扫描源、云端确认成功、高危,直接定性,不耗 token。
-   - 第 1 层(明显失败,规则过筛):源包完整且响应全为 4xx 失败码、或纯扫描器特征且云端判失败,直接忽略。**5xx 不再算安全失败**(可能是 RCE/注入打崩服务),`attack_result=2/3` 也不再单独构成忽略理由。
-   - 第 2 层(不明显,深度研判):其余告警一律 **主动拉取源数据包** —— 公网攻击查 `rule_threatinfo`,内网横向(10.x/172.x)查 `netflow_nta` 全流量并解码 HTTP 请求/响应体。**拉到 HTTP 源包后,模型必须基于真实包给出有依据的初步结论**(确认成功/未成功/未见成功证据等 + `关键证据` 原文),不再只贴标签。高危批次自动升 high 推理强度。只要抓到源包就走源包深度复核,不因首轮浅标签而跳过。
-   - 第 3 层(高危/需人工复核,Agent 工具循环):对高危或仍需人工复核的告警,升级为 **Agent 工具循环研判** —— 给模型一组只读取证工具(`pull_packets`/`decode_hex`/`get_related_alerts`),模型自主决定取哪些证、取几轮,最后基于真实证据给出带 `工具轨迹` 的结论。复用 Codex 订阅鉴权(无需 API key)。工具只读取证,处置仍由本地规则执行。
-4. 自动忽略模型判定为扫描探测、确认未成功和未见成功证据的告警。
-5. 保留确认成功、证据不足和高危告警，并发送企微通知。
-6. 每日生成告警汇总报告。
+## 研判流程
 
-### Agent 工具循环说明
+```text
+腾讯云告警中心
+→ 实时轮询新告警
+→ 默认白名单 / 自定义规则
+→ 主动拉取源包和流量证据
+→ LLM 批量初判
+→ 源包二次复核
+→ 高危 / 需人工复核进入 Agent 工具循环
+→ PolicyGuard 策略闸
+→ 自动忽略 / 人工研判推送 / 日报归档
+```
 
-- 通过 `chatgpt.com/backend-api/codex/responses` 的原生 function calling 实现,鉴权复用 `~/.codex/auth.json`,不需要 OpenAI API key。
-- 只对高危/需人工复核的告警触发(贵+慢),由 `llm.agent_triage` 配置控制开关、轮数、并发、单次上限。
-- 最后一轮强制 `tool_choice=none`,确保模型必须给出结论而非无限取证。
-- 安全闸:Agent 判“确认成功”但该告警无落地源包证据时,降回“未见成功证据”。Agent 失败时保留原研判,不影响主流程。
+### 本地规则层
 
-### 调用重试
+本地规则先定边界，避免把安全动作完全交给模型：
 
-所有 Codex 调用(单轮/源包复核/Agent)在连接类错误(超时、连接被拒、流中断)上自动指数退避重试,降低 `WinError 10060/10061` 导致的降级。`HTTPError` 等业务错误不重试。重试事件记入 `logs/llm-errors.jsonl`,控制台健康面板可见。由 `llm.retry`(`max_retries`/`backoff_seconds`/`backoff_factor`)配置。
+- 腾讯云扫描源、公司扫描源命中后判定为扫描探测。
+- 自定义规则可跳过模型、忽略单次、扫描源加白或标记人工复核。
+- 腾讯云标记攻击成功的告警永不自动忽略。
+- 高危告警默认保留，只有明确无害且有证据时才可能自动忽略。
+- 只有源包完整关联且响应为安全失败码时才直接忽略。
+- `5xx` 不作为安全失败，因为利用尝试可能打崩服务。
 
-### 源包抓取说明
+### 证据增强
 
-- HTTP 是唯一能稳定拿到应用层 payload 的协议:`netflow_nta` 按 `app_protocol=HTTP` 过滤(而非 `event_type`,后者会把部分本质 HTTP 的流标成 TCP),可解码请求头/响应头/响应体。
-- `netflow_nta` 的 `DescribeLogs` 仅对整点对齐的时间窗返回数据,带分秒边界会返回空;抓取时已将查询窗口下/上取整到整点。
-- TLS 为密文、UNKNOWN 无结构、纯 TCP/UDP 无 payload,均无法拉到内容,这类回退到聚合字段研判(证据不足时保留人工)。
+模型研判前会尽量补真实证据：
 
-项目使用 `codex_direct`：读取本机 `~/.codex/auth.json` 的 Codex 登录鉴权，直接请求 Responses 接口。普通告警走单轮结构化 JSON 研判；高危/需人工复核的告警额外走 Agent 工具调用循环(同样复用 Codex 订阅,经 Responses 原生 function calling)。模型只做研判与只读取证，腾讯云查询和忽略/加白处置由本地 Python 代码按固定规则执行，模型不直接操作云资源。
+- 公网攻击优先查询 `rule_threatinfo`。
+- 内网横向和内网业务误报 fallback 查询 `netflow_nta`。
+- 能解析 HTTP 时提取 `req`、`resp`、`resp_body`、`cmd`、`req_mark`、`resp_mark`。
+- TLS、UNKNOWN、纯 TCP/UDP 没有应用层 payload 时，回退到聚合字段和人工研判。
+
+### Agent 工具循环
+
+高危或仍需人工复核的告警会进入 Agent 工具循环。Agent 只能读取证据，不能直接处置云资源。
+
+可用工具：
+
+- `pull_packets`：拉取源包证据。
+- `query_flow`：查询 NTA 流量上下文。
+- `identify_asset`：识别源/目标资产。
+- `check_ip_history`：查询源 IP 历史告警。
+- `get_related_alerts`：查询相关告警。
+- `decode_hex`：解码 payload。
+
+### PolicyGuard
+
+所有自动处置都经过本地策略闸：
+
+- `确认成功` 永不忽略。
+- 云端 `AttackResult=1` 永不忽略。
+- 有命令回显、webshell、敏感数据返回、文件落地等成功证据时永不忽略。
+- 高危告警低置信度不自动忽略。
+- 扫描源加白必须来自可信规则，高危扫描源不自动加白。
+
+## Agent 化模块
+
+`agent/` 是后续主线改造边界：
+
+- `agent.schemas`：告警、证据、研判结论、处置计划、策略结果的数据结构。
+- `agent.policy`：本地 `PolicyGuard`，模型/Agent 只能建议，写操作必须过闸。
+- `agent.rules`：自定义规则、自然语言规则草案、规则匹配。
+- `agent.triage_flow`：规则、证据、模型、Agent、策略闸的流水线骨架。
+- `agent.triage_service`：单条告警 dry-run 预览，供控制台验证。
+- `agent.llm`：Codex、Claude、DeepSeek、GLM、OpenAI-compatible provider 路由。
+
+## 多模型路由
+
+`llm.routing` 可按阶段选择模型：
+
+- `batch_triage`：普通告警批量初判，适合 DeepSeek/GLM 快模型。
+- `source_review`：源包复核，适合强推理模型。
+- `agent_triage`：高危/疑难告警工具循环，适合 Codex/Claude。
+- `rule_parse`：自然语言规则解析。
+- `fallback`：备用模型。
+
+支持 provider 类型：
+
+- `codex_direct`：复用本机 Codex/ChatGPT 订阅登录态。
+- `openai_compatible`：OpenAI API、DeepSeek、GLM 等兼容 Chat Completions 的 API。
+- `anthropic`：Claude API。
+- `claude_cli` / `local_cli`：Claude Code 或其他本地订阅 CLI。
 
 ## 安装
 
@@ -43,7 +104,7 @@ python -m pip install -r requirements.txt
 Copy-Item config.example.json config.json
 ```
 
-配置腾讯云 CLI 凭证，或设置：
+配置腾讯云 CLI 凭证，或设置环境变量：
 
 ```powershell
 $env:TENCENTCLOUD_SECRET_ID = "..."
@@ -52,45 +113,26 @@ $env:TENCENTCLOUD_SECRET_KEY = "..."
 
 使用 `codex_direct` 前，需要本机 Codex 已登录并存在 `~/.codex/auth.json`。
 
-## 配置
+真实 `config.json`、`.private-tccli/`、告警数据、日志和报告均被 `.gitignore` 排除。
 
-编辑本地 `config.json`：
+## 常用命令
 
-- `tencent_scan_ips`：腾讯云扫描 IP，排除处置。
-- `company_scan_ips`：公司漏扫 IP，排除处置。
-- `wecom.webhook_url`：企微机器人 webhook。
-- `llm.model`：研判模型。
-- `llm.auto_dispose.ignore_results`：允许自动忽略的研判结果。
-
-真实 `config.json`、告警数据、日志和报告均被 `.gitignore` 排除。
-
-## 使用
-
-拉取并处理最近一小时：
+启动实时轮询：
 
 ```powershell
-python .\cfw_alert_monitor.py collect --lookback-hours 1
+.\run_realtime_triage.ps1
 ```
 
-仅采集，不执行研判和处置：
+手动跑一轮，不执行云端写操作：
+
+```powershell
+python .\cfw_alert_center_triage.py --realtime-once --dry-run
+```
+
+每小时只采集，不研判、不处置、不发小时报：
 
 ```powershell
 python .\cfw_alert_monitor.py collect --lookback-hours 1 --skip-triage
-```
-
-研判告警中心最近两天未处理告警：
-
-```powershell
-python .\cfw_alert_center_triage.py --days 2
-```
-
-指定时间窗预览，不处置：
-
-```powershell
-python .\cfw_alert_center_triage.py `
-  --start "2026-06-09 18:00:00" `
-  --end "2026-06-09 23:59:59" `
-  --dry-run
 ```
 
 生成当日日报：
@@ -99,76 +141,79 @@ python .\cfw_alert_center_triage.py `
 python .\cfw_alert_monitor.py report --refresh
 ```
 
-Windows 计划任务可分别调用：
+启动本地 SOC 控制台：
 
-- `run_collect.ps1`
-- `run_daily_report.ps1`
+```powershell
+python .\console.py
+```
+
+访问：
+
+- `http://127.0.0.1:8787/soc/`：SOC 控制台。
+- `http://127.0.0.1:8787/screen`：安全态势大屏。
+
+## 页面
+
+- 态势总览：告警量、研判分布、自动处置、系统健康。
+- 告警研判台：告警明细、源包证据、工具轨迹、人工研判。
+- 攻击者画像：按攻击源聚合，展示攻击阶段、评分和建议。
+- 研判流水线：轮询、研判、策略闸、通知链路。
+- 自定义规则：规则库、传统黑白名单、自然语言规则、默认白名单。
+- Agent 配置：模型路由、provider 健康、API/订阅配置。
+- 日报周报：安全运营摘要和防火墙能力规划。
+
+## 企业微信通知
+
+全部走 `wecom` 配置：
+
+- `manual_enabled`：是否推送需人工研判告警。
+- `manual_at_all`：人工研判时是否 `@所有人`。
+- `manual_webhook_url`：人工研判专用 webhook；为空则使用 `webhook_url`。
+- `daily_enabled`：是否保留日报推送。
+- `hourly_enabled`：小时报开关，当前默认关闭。
+
+## 自定义规则
+
+自然语言规则会先生成草案，保存/生效后才进入实时研判流程。
+
+例子：
+
+```text
+事件编号 123456 是正常业务，以后同源同目标同规则不研判。
+```
+
+```text
+把下面 txt 里的 IP 加入黑名单：1.2.3.4 5.6.7.8
+```
+
+规则命中后仍会经过 `PolicyGuard`，不能覆盖“云端成功”“确认成功”“高危证据不足”等硬保留条件。
 
 ## 攻击者画像
 
-把逐条告警升级到"按攻击者维度"研判:将一段时间窗内告警中心的全部告警按攻击源 IP 聚合(攻击序列、手法多样性、杀伤链阶段、目标数、是否得手),再喂模型给出攻击者类型、意图、**攻击叙事**(一句话讲清这个 IP 先做了什么再做了什么、有没有得手)、当前杀伤链阶段、画像威胁评分和处置建议。高危画像自动推企微卡片。
-
 ```powershell
-python .\attacker_profile.py --days 2            # 跑画像,高危推企微
-python .\attacker_profile.py --days 2 --dry-run  # 只算不推
-python .\attacker_profile.py --days 2 --top 10   # 只画像 top N 活跃攻击者
+python .\attacker_profile.py --days 2
+python .\attacker_profile.py --days 2 --dry-run
+python .\attacker_profile.py --days 2 --top 10
 ```
 
-日报任务 `run_daily_report.ps1` 已自动包含画像环节。只对值得的攻击者(多手法/高危/内网横向/高频次)做模型画像以控成本;综合模型分与规则分取较高,避免任一侧漏判。
+画像按攻击源 IP 聚合告警，输出攻击阶段、手法序列、目标范围、是否得手、画像评分和处置建议。当前阶段标签为：
 
-## 通知渠道
-
-全部走企微机器人(`wecom` 配置):
-
-- **小时/日报汇总**:`hourly_enabled` / `daily_enabled`。
-- **需人工研判推送**:研判结果为"需人工复核"或"确认成功"的,单独推一张企微卡片,并发一条 `@所有人` 的 text 提醒(企微 markdown 不支持 @,故补一条 text)。误报不推。
-
-`config.json` 的 `wecom` 相关键:
-
-- `webhook_url`:企微机器人 webhook(汇总和需人工默认共用)。
-- `manual_enabled`:是否推需人工研判(默认开)。
-- `manual_at_all`:需人工时是否 @所有人(默认开)。
-- `manual_max_items`:单条卡片最多列几条(默认 10)。
-- `manual_webhook_url`:需人工研判专用 webhook,留空则用 `webhook_url`(想推到独立告警群就配这个)。
-
-## 安全态势大屏
-
-`python console.py` 起服务后,浏览器打开 **http://127.0.0.1:8787/screen** 即安全态势大屏(适合挂屏):
-
-- KPI 大数字:今日告警量 / 自动处置 / 需人工复核 / 确认成功(确认成功 >0 时闪烁)
-- 每日告警趋势(柱+线双轴)、研判结果分布(环形)
-- 攻击来源 TOP、被攻击资产 TOP(🌐公网 / 🏠内网标记)
-- 🔴 需重点关注实时列表(高危/确认成功/需人工,方向+来源→目标+研判)
-- 系统健康:源包命中率 / 降级率 / 处置失败 / 重试队列 / Agent 研判
-- 深色科技风,30 秒自动刷新
-
-`http://127.0.0.1:8787/`(根路径)是研判控制台(明细+筛选+下钻),`/screen` 是大屏。
-
-## 控制台
-
-本地 Web 看板，看告警量、研判分布、token 消耗(按研判来源拆分)、源包命中率、降级/处置健康，并可下钻每条告警的证据链和工具轨迹。数据读 `data/` 与 `reports/`，无数据库，默认只绑定本机回环。
-
-```powershell
-python -m pip install flask
-python .\console.py            # 打开 http://127.0.0.1:8787
-# 或
-.\run_console.ps1 8787
+```text
+探测 → 尝试利用 → 成功利用 → 落地驻留 → 控制回连 → 横向扩散 → 外传/破坏
 ```
 
-命令行快速汇总(无需浏览器)：
+## Windows 计划任务
 
-```powershell
-python .\triage_stats.py --days 7          # 文字报表
-python .\triage_stats.py --days 7 --json   # 完整 JSON
-```
+建议拆成三类任务：
 
-## 自动忽略覆盖
-
-告警中心安全处置(`llm.alert_center_auto_dispose`)的 `lookback_hours` 决定每次小时任务回看多久的未处理告警。设为 24 表示**每小时扫全天积压并忽略**,避免 2 小时窗口外的告警堆积到日报才清。已处理的告警自动排除,`deep_triage_max` 封顶模型成本,`timeout_seconds` 控制在计划任务时限内。只忽略规则可定(4xx/扫描)与模型确认无害的结果,确认成功/高危一律保留。
+- `run_realtime_triage.ps1`：常驻实时轮询，发现新告警立即研判。
+- `run_collect.ps1`：每小时采集流量日志，不发小时报。
+- `run_daily_report.ps1`：每天 17:50 生成日报并推送。
 
 ## 安全边界
 
-- 工具不会自动封禁攻击 IP。
-- 白名单扫描源不会执行封禁。
-- 只有配置允许的明确失败、扫描探测和未见成功证据告警会自动忽略。
-- 确认成功、高危或证据不足告警会保留复核。
+- 模型和 Agent 不直接操作腾讯云资源。
+- 自动忽略、扫描源加白、黑名单封禁都由本地 Python 代码执行。
+- 封禁类动作必须显式确认，不在实时轮询里自动执行。
+- 所有自动忽略必须经过 `PolicyGuard`。
+- 所有真实凭证、运行数据、报告和日志都不进入 Git。

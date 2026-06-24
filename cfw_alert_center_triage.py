@@ -2,6 +2,7 @@ import argparse
 import csv
 import hashlib
 import hmac
+import ipaddress
 import json
 import time
 from collections import Counter
@@ -60,6 +61,74 @@ SAFE_FAILURE_HTTP_CODES = {
     "429",
 }
 _LOCAL_EVENT_CACHE = {}
+REALTIME_STATE_PATH = DATA_DIR / "realtime-poll-state.json"
+BLOCK_IP_CONFIRM_TOKEN = "CONFIRM_TENCENT_CFW_BLOCK"
+
+
+def _record_id(record):
+    return str(record.get("EventId") or record.get("AlertClusterId") or "")
+
+
+def _realtime_config(config):
+    cfg = dict(config.get("realtime_triage") or {})
+    cfg.setdefault("enabled", True)
+    cfg.setdefault("interval_seconds", 60)
+    cfg.setdefault("lookback_minutes", 10)
+    cfg.setdefault("max_records_per_round", 80)
+    cfg.setdefault("dedupe_hours", 24)
+    cfg.setdefault("manual_notify_cooldown_minutes", 240)
+    cfg.setdefault("auto_dispose", True)
+    cfg.setdefault("push_manual", True)
+    cfg.setdefault("state_file", str(REALTIME_STATE_PATH))
+    return cfg
+
+
+def _realtime_state_path(config):
+    cfg = _realtime_config(config)
+    path = Path(str(cfg.get("state_file") or REALTIME_STATE_PATH))
+    if not path.is_absolute():
+        path = ROOT / path
+    return path
+
+
+def _load_realtime_state(config):
+    path = _realtime_state_path(config)
+    if not path.exists():
+        return {"processed": {}, "manual_notified": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"processed": {}, "manual_notified": {}}
+        data.setdefault("processed", {})
+        data.setdefault("manual_notified", {})
+        return data
+    except Exception:
+        return {"processed": {}, "manual_notified": {}}
+
+
+def _save_realtime_state(config, state):
+    path = _realtime_state_path(config)
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _prune_realtime_state(state, now=None, dedupe_hours=24, notify_cooldown_minutes=240):
+    now = now or monitor.now_local()
+    processed_cutoff = now - timedelta(hours=max(1, int(dedupe_hours)))
+    notify_cutoff = now - timedelta(minutes=max(1, int(notify_cooldown_minutes)))
+
+    def keep_recent(mapping, cutoff):
+        out = {}
+        for key, value in dict(mapping or {}).items():
+            ts = value.get("time") if isinstance(value, dict) else value
+            parsed = parse_local_time(ts)
+            if parsed and parsed >= cutoff:
+                out[str(key)] = value
+        return out
+
+    state["processed"] = keep_recent(state.get("processed") or {}, processed_cutoff)
+    state["manual_notified"] = keep_recent(state.get("manual_notified") or {}, notify_cutoff)
+    return state
 
 
 def compact_join(values, limit=8):
@@ -176,6 +245,139 @@ def tc3_api(config, action, payload):
     if payload.get("Error"):
         raise RuntimeError(json.dumps(payload["Error"], ensure_ascii=False))
     return payload
+
+
+def _block_ip_config(config):
+    cfg = dict((config or {}).get("block_ip") or {})
+    cfg.setdefault("enabled", True)
+    cfg.setdefault("direction_list", "0,1")
+    cfg.setdefault("end_time", "2099-12-31 23:59:59")
+    cfg.setdefault("fw_type", 1)
+    cfg.setdefault("cover_duplicate", 1)
+    cfg.setdefault("batch_size", 50)
+    cfg.setdefault("comment_prefix", "cfw-alert-automation")
+    return cfg
+
+
+def _normalize_block_ips(values):
+    valid = []
+    invalid = []
+    seen = set()
+    for value in values or []:
+        item = str(value or "").strip()
+        if not item:
+            continue
+        try:
+            ip = ipaddress.ip_address(item)
+        except ValueError:
+            invalid.append(item)
+            continue
+        if ip.version != 4 or ip.is_unspecified or ip.is_multicast or ip.is_loopback:
+            invalid.append(item)
+            continue
+        normalized = str(ip)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        valid.append(normalized)
+    return valid, invalid
+
+
+def _batch(items, size):
+    size = max(1, int(size or 50))
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def build_block_ip_payloads(config, ips, comment=""):
+    """Build Tencent CFW CreateBlockIgnoreRuleNew payloads for IP blacklist rules."""
+
+    cfg = _block_ip_config(config or {})
+    valid, invalid = _normalize_block_ips(ips)
+    prefix = str(cfg.get("comment_prefix") or "cfw-alert-automation").strip()
+    detail = str(comment or "natural language block ip").strip()
+    full_comment = (prefix + (": " + detail if detail else ""))[:128]
+    payloads = []
+    for group in _batch(valid, cfg.get("batch_size")):
+        payloads.append({
+            "Rules": [
+                {
+                    "Ioc": ip,
+                    "DirectionList": str(cfg.get("direction_list") or "0,1"),
+                    "EndTime": str(cfg.get("end_time") or "2099-12-31 23:59:59"),
+                    "FwType": int(cfg.get("fw_type") or 1),
+                    "Comment": full_comment,
+                }
+                for ip in group
+            ],
+            "RuleType": 1,
+            "CoverDuplicate": int(cfg.get("cover_duplicate") or 1),
+        })
+    return {
+        "api_action": "CreateBlockIgnoreRuleNew",
+        "payloads": payloads,
+        "ips": valid,
+        "invalid_ips": invalid,
+        "config": {
+            "direction_list": str(cfg.get("direction_list") or "0,1"),
+            "end_time": str(cfg.get("end_time") or "2099-12-31 23:59:59"),
+            "fw_type": int(cfg.get("fw_type") or 1),
+            "cover_duplicate": int(cfg.get("cover_duplicate") or 1),
+            "batch_size": int(cfg.get("batch_size") or 50),
+            "enabled": bool(cfg.get("enabled", True)),
+        },
+    }
+
+
+def create_block_ip_rules(config, ips, comment="", dry_run=True, confirm_token=""):
+    """Preview or create Tencent CFW IP blacklist rules.
+
+    Actual cloud mutation requires dry_run=False and a fixed confirmation token.
+    """
+
+    preview = build_block_ip_payloads(config or {}, ips, comment=comment)
+    result = {
+        "action": "tencent_cfw_block_ip",
+        "dry_run": bool(dry_run),
+        "api_action": preview["api_action"],
+        "ips": preview["ips"],
+        "invalid_ips": preview["invalid_ips"],
+        "ip_count": len(preview["ips"]),
+        "payloads": preview["payloads"],
+        "config": preview["config"],
+    }
+    if not preview["ips"]:
+        result["error"] = "no_valid_ips"
+        return result
+    if dry_run:
+        result["status"] = "preview"
+        return result
+    if confirm_token != BLOCK_IP_CONFIRM_TOKEN:
+        result["error"] = "missing_confirm_token"
+        return result
+    if not preview["config"].get("enabled", True):
+        result["error"] = "block_ip_disabled"
+        return result
+
+    results = []
+    for payload in preview["payloads"]:
+        try:
+            response = tc3_api(config, preview["api_action"], payload)
+            results.append({
+                "count": len(payload.get("Rules") or []),
+                "request_id": response.get("RequestId"),
+                "return_code": response.get("ReturnCode"),
+                "return_msg": response.get("ReturnMsg"),
+                "status": response.get("Status"),
+            })
+        except Exception as exc:
+            results.append({
+                "count": len(payload.get("Rules") or []),
+                "error": str(exc)[:500],
+            })
+    result["results"] = results
+    result["status"] = "executed" if results and not any(item.get("error") for item in results) else "partial_or_failed"
+    return result
 
 
 def fetch_unhandled_alert_center_range(config, start, end):
@@ -547,6 +749,17 @@ def deep_triage_records(config, records, labels):
         if item:
             by_event[row["告警ID"]] = item
 
+    # PolicyGuard 需要看到本轮使用的真实证据。保留在内存返回值中,落盘时
+    # apply_judgements 仍会按原有字段输出。
+    row_by_event = {row["告警ID"]: row for row in rows}
+    for event_id, item in list(by_event.items()):
+        row = row_by_event.get(event_id) or {}
+        if row and isinstance(item, dict):
+            item.setdefault("源包证据", row.get("源包证据") or {})
+            item.setdefault("告警等级", row.get("告警等级") or "")
+            item.setdefault("攻击IP", row.get("攻击IP") or "")
+            item.setdefault("目标IP", row.get("目标IP") or "")
+
     # 写回业务误报内容记忆:本轮判为业务误报的(无论来自模型还是短路),沉淀指纹
     if triage_memory:
         for row in rows:
@@ -561,6 +774,171 @@ def deep_triage_records(config, records, labels):
                             asset=row.get("目标资产", ""))
                     except Exception:
                         pass
+    return by_event
+
+
+def _policy_evidence_from_judgement(item):
+    evidence = item.get("源包证据") or item.get("source_evidence") or {}
+    if isinstance(evidence, dict):
+        return evidence
+    if isinstance(evidence, str) and evidence.strip():
+        try:
+            return json.loads(evidence)
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _policy_allows_omit(record, judgement):
+    """Run the new agent PolicyGuard before automatic alert-center omission."""
+    return _policy_allows_plan(record, judgement, None, None)
+
+
+def _policy_allows_plan(record, judgement, plan=None, matched_rule=None):
+    """Run PolicyGuard for an arbitrary action plan.
+
+    Returns (has_allowed_action, serializable_policy_summary).
+    """
+    if not record:
+        return False, {"reason": "missing_alert_record"}
+    try:
+        from agent.policy import PolicyGuard
+        from agent.schemas import ActionPlan, AlertTask, EvidenceBundle, TriageVerdict
+    except Exception:
+        # Import failure should not break the legacy job; keep the old branch
+        # behavior visible in logs by returning a conservative denial.
+        return False, {"reason": "policy_import_failed"}
+
+    alert = AlertTask.from_alert_center_record(record)
+    verdict = TriageVerdict.from_judgement(judgement)
+    evidence = EvidenceBundle(source_packet=_policy_evidence_from_judgement(judgement))
+    decision = PolicyGuard().evaluate(
+        alert,
+        evidence,
+        verdict,
+        plan or ActionPlan.omit(alert.alert_id, verdict.result),
+        matched_rule,
+    )
+    return bool(decision.allowed_actions), {
+        "allowed_actions": decision.allowed_actions,
+        "blocked_actions": decision.blocked_actions,
+        "requires_human": decision.requires_human,
+        "reason": decision.reason,
+    }
+
+
+def _matching_custom_rules(record, store=None):
+    try:
+        from agent.rules import CustomRuleStore
+        from agent.schemas import AlertTask
+    except Exception:
+        return []
+    store = store or CustomRuleStore()
+    try:
+        return store.matching_rules(AlertTask.from_alert_center_record(record))
+    except Exception:
+        return []
+
+
+def _custom_rule_judgement(record, rule):
+    action = str(rule.get("action") or "")
+    event_id = str(record.get("EventId") or record.get("AlertClusterId") or "")
+    src_ip = compact_join(record.get("SrcIpList") or [], 10)
+    evidence = record.get("source_evidence") if isinstance(record.get("source_evidence"), dict) else {}
+    if action == "allow_scanner_ip":
+        result = "扫描探测"
+        reason = "命中自定义扫描源规则"
+        next_step = "创建扫描源白名单并忽略"
+    else:
+        result = "业务误报"
+        reason = "命中自定义业务误报规则"
+        next_step = "按规则跳过模型并忽略"
+    return {
+        "告警ID": event_id,
+        "攻击IP": src_ip,
+        "模型研判": result,
+        "模型置信度": "高",
+        "研判理由": reason,
+        "关键证据": str(rule.get("rule_id") or rule.get("source_text") or "")[:160],
+        "下一步": next_step,
+        "研判来源": "custom_rule",
+        "研判模型": "rule",
+        "输入Token": "0",
+        "输出Token": "0",
+        "推理Token": "0",
+        "源包证据": evidence,
+        "自定义规则ID": rule.get("rule_id", ""),
+    }
+
+
+def _custom_rule_plan(record, rule):
+    from agent.schemas import ActionPlan
+    action = str(rule.get("action") or "")
+    event_id = str(record.get("EventId") or record.get("AlertClusterId") or "")
+    if action in ("skip_llm_and_omit", "omit_once"):
+        return ActionPlan.omit(event_id, "自定义规则命中")
+    if action == "allow_scanner_ip":
+        src_ips = [str(ip) for ip in (record.get("SrcIpList") or []) if str(ip)]
+        return ActionPlan(actions=[{
+            "type": "allow_scanner_ip",
+            "ip": src_ips[0] if src_ips else "",
+            "trusted_source": bool(rule.get("trusted_source")),
+            "reason": "自定义扫描源规则",
+        }])
+    return ActionPlan(requires_human=True, reason="自定义规则仅标注")
+
+
+def custom_rule_decision(record, store=None):
+    """Return a safe-hourly decision produced by an active custom rule, if any."""
+    for rule in _matching_custom_rules(record, store=store):
+        action = str(rule.get("action") or "")
+        if action not in ("skip_llm_and_omit", "omit_once", "allow_scanner_ip"):
+            continue
+        judgement = _custom_rule_judgement(record, rule)
+        plan = _custom_rule_plan(record, rule)
+        allowed, policy = _policy_allows_plan(record, judgement, plan, rule)
+        if not allowed:
+            continue
+        base = safe_hourly_decision(record, {})
+        base["ignore"] = any(a.get("type") == "omit_alert" for a in plan.actions) or action == "allow_scanner_ip"
+        base["reason"] = "自定义规则命中:" + str(rule.get("rule_id") or action)
+        base["custom_rule_id"] = rule.get("rule_id", "")
+        base["custom_rule_action"] = action
+        base["policy"] = policy
+        if action == "allow_scanner_ip":
+            base["custom_white_hits"] = [str(ip) for ip in (record.get("SrcIpList") or []) if str(ip)]
+        return base
+    return None
+
+
+def apply_custom_rules_to_rows(rows, store=None):
+    """Apply active custom rules before model triage.
+
+    Returns {alert_id: judgement}. The caller should exclude these rows from
+    LLM work. Scanner whitelist rules also populate row["_white_hits"] so the
+    existing allow_scanner_ips path can create Tencent CFW rules.
+    """
+    by_event = {}
+    for row in rows:
+        record = row.get("_record") or {}
+        for rule in _matching_custom_rules(record, store=store):
+            action = str(rule.get("action") or "")
+            if action not in ("skip_llm_and_omit", "omit_once", "allow_scanner_ip"):
+                continue
+            judgement = _custom_rule_judgement(record, rule)
+            plan = _custom_rule_plan(record, rule)
+            allowed, policy = _policy_allows_plan(record, judgement, plan, rule)
+            if not allowed:
+                continue
+            judgement["策略闸"] = policy
+            by_event[row["告警ID"]] = judgement
+            row["_custom_rule"] = rule
+            if action == "allow_scanner_ip":
+                row["_white_hits"] = sorted(set((row.get("_white_hits") or []) + [
+                    str(ip) for ip in (record.get("SrcIpList") or []) if str(ip)
+                ]))
+                row["白名单状态"] = "custom_rule:" + str(rule.get("rule_id") or "")
+            break
     return by_event
 
 
@@ -582,7 +960,15 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
                     record["source_evidence"] = ev
             except Exception:
                 pass
-    decisions = [safe_hourly_decision(record, labels) for record in records]
+    decisions = []
+    custom_rule_hits = 0
+    for record in records:
+        custom = custom_rule_decision(record)
+        if custom:
+            decisions.append(custom)
+            custom_rule_hits += 1
+        else:
+            decisions.append(safe_hourly_decision(record, labels))
     ignore_ids = [item["event_id"] for item in decisions if item["ignore"] and item["event_id"]]
 
     # 第2层:对规则未筛掉、且非高危/非云端成功的“不明显”告警跑深度研判。
@@ -634,6 +1020,7 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
 
         if deep_records:
             deep_judgements = deep_triage_records(config, deep_records, labels)
+            deep_record_by_id = {str(r.get("EventId") or r.get("AlertClusterId") or ""): r for r in deep_records}
             high_ids = {item["event_id"] for item in decisions if item.get("level") == "High"}
             deep_ignore_ids = []
             for event_id, item in deep_judgements.items():
@@ -653,6 +1040,10 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
                     # 业务误报对高危额外要求:必须有真实源包证据(防臆测放行)
                     if result == "业务误报" and not (item.get("关键证据") or item.get("源包证据")):
                         continue
+                allowed, policy = _policy_allows_omit(deep_record_by_id.get(str(event_id), {}), item)
+                item["策略闸"] = policy
+                if not allowed:
+                    continue
                 deep_ignore_ids.append(event_id)
             ignore_ids = ignore_ids + deep_ignore_ids
 
@@ -676,6 +1067,13 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
                 pass
 
     white_records = [record_to_judge_row(record, labels, config) for record in records if white_hits(record, labels)]
+    for record, item in zip(records, decisions):
+        if not item.get("custom_white_hits"):
+            continue
+        row = record_to_judge_row(record, labels, config)
+        row["_white_hits"] = item["custom_white_hits"]
+        row["白名单状态"] = "custom_rule:" + str(item.get("custom_rule_id") or "")
+        white_records.append(row)
     omit_actions = []
     white_actions = []
     if not dry_run:
@@ -710,6 +1108,7 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
         "retained_high": sum(item.get("level") == "High" for item in retained),
         "retained_success": sum(item.get("attack_result") == "1" for item in retained),
         "ignore_reasons": dict(Counter(item["reason"] for item in decisions if item["ignore"])),
+        "custom_rule_hits": custom_rule_hits,
         "retained_reasons": dict(Counter(item["reason"] for item in retained)),
         "retained_events": dict(Counter(item["event_name"] for item in retained)),
         "retained_items": retained[:20],
@@ -815,6 +1214,50 @@ def apply_judgements(rows, judgements):
             merged[key] = item.get(key, "")
         out.append(merged)
     return out
+
+
+def attach_policy_fields(judgements, rows):
+    row_by_event = {row.get("告警ID"): row for row in rows if row.get("告警ID")}
+    for event_id, item in list((judgements or {}).items()):
+        if not isinstance(item, dict):
+            continue
+        row = row_by_event.get(event_id) or {}
+        item.setdefault("源包证据", row.get("源包证据") or {})
+        item.setdefault("告警等级", row.get("告警等级") or "")
+        item.setdefault("攻击IP", row.get("攻击IP") or "")
+        item.setdefault("目标IP", row.get("目标IP") or "")
+    return judgements
+
+
+def can_ignore_judged_row(row, records, judgements):
+    result = row.get("模型研判")
+    if result not in IGNORE_RESULTS or not row.get("告警ID"):
+        return False
+    if row.get("告警等级") == "高危":
+        if result not in ("确认未成功", "扫描探测", "业务误报"):
+            return False
+        if row.get("模型置信度") == "低":
+            return False
+        if result == "业务误报" and not (row.get("关键证据") or row.get("源包证据")):
+            return False
+    rec_by_id = {_record_id(record): record for record in records}
+    allowed, _ = _policy_allows_omit(rec_by_id.get(row.get("告警ID"), {}), judgements.get(row.get("告警ID"), row))
+    return allowed
+
+
+def manual_review_candidates(judged_rows, ignore_ids):
+    ignore_set = {str(event_id) for event_id in (ignore_ids or []) if str(event_id)}
+    candidates = []
+    for row in judged_rows:
+        event_id = str(row.get("告警ID") or "")
+        if not event_id or event_id in ignore_set:
+            continue
+        if row.get("研判来源") == "rule_whitelist":
+            continue
+        if not row.get("模型研判"):
+            continue
+        candidates.append(row)
+    return candidates
 
 
 def white_rule_candidates(rows):
@@ -975,12 +1418,174 @@ def recover_degraded_queue(config, dry_run=False, max_records=200):
     return result
 
 
+def realtime_triage_once(config, dry_run=False):
+    """Poll recent unhandled alert-center events and triage only new EventIds."""
+
+    cfg = _realtime_config(config)
+    now = monitor.now_local()
+    now_text = monitor.dt_text(now)
+    state = _prune_realtime_state(
+        _load_realtime_state(config),
+        now=now,
+        dedupe_hours=int(cfg.get("dedupe_hours", 24)),
+        notify_cooldown_minutes=int(cfg.get("manual_notify_cooldown_minutes", 240)),
+    )
+    end = now
+    start = now - timedelta(minutes=max(1, int(cfg.get("lookback_minutes", 10))))
+    records, query = fetch_unhandled_alert_center_range(config, start, end)
+    records, dedup_stats = merge_forward_duplicates(records)
+    processed = state.get("processed") or {}
+    new_records = []
+    for record in records:
+        event_id = _record_id(record)
+        if not event_id or event_id in processed:
+            continue
+        new_records.append(record)
+    max_records = int(cfg.get("max_records_per_round", 80))
+    new_records = new_records[:max_records]
+
+    result = {
+        "mode": "realtime_triage_once",
+        "dry_run": dry_run,
+        "query_start": query["start"],
+        "query_end": query["end"],
+        "query_total": query["total"],
+        "active_before": len(records),
+        "new_records": len(new_records),
+        "dedup_removed": dedup_stats.get("dup_removed", 0),
+        "state_file": str(_realtime_state_path(config)),
+    }
+    if not new_records:
+        monitor.append_jsonl(
+            DATA_DIR / f"realtime-poll-{now.strftime('%Y-%m-%d')}.jsonl",
+            [dict(result, recorded_at=now_text)],
+        )
+        if not dry_run:
+            _save_realtime_state(config, state)
+        return result
+
+    model = (config.get("llm") or {}).get("model", "gpt-5.5")
+    labels = whitelist_labels(config)
+    rows = [record_to_judge_row(record, labels, config) for record in new_records]
+    custom_judgements = apply_custom_rules_to_rows(rows)
+    white_rows = [row for row in rows if row["_white_hits"]]
+    llm_rows = [row for row in rows if not row["_white_hits"] and row["告警ID"] not in custom_judgements]
+    judgements = {row["告警ID"]: deterministic_white_judgement(row, model) for row in white_rows}
+    judgements.update(custom_judgements)
+    judgements.update(monitor.llm_judge_rows(config, llm_rows))
+    attach_policy_fields(judgements, rows)
+    judged_rows = apply_judgements(rows, judgements)
+    ignore_ids = [row["告警ID"] for row in judged_rows if can_ignore_judged_row(row, new_records, judgements)]
+
+    white_actions = []
+    omit_actions = []
+    if not dry_run and bool(cfg.get("auto_dispose", True)):
+        white_actions = allow_scanner_ips(config, rows)
+        omit_actions = omit_alert_center_events(
+            config,
+            ignore_ids,
+            int((config.get("llm") or {}).get("auto_dispose", {}).get("batch_size", 50)),
+        )
+
+    manual_rows = manual_review_candidates(judged_rows, ignore_ids)
+    notified = state.get("manual_notified") or {}
+    pending_manual_rows = [row for row in manual_rows if str(row.get("告警ID") or "") not in notified]
+    manual_push = {"sent": False, "reason": "dry_run" if dry_run else "no_manual_items"}
+    if not dry_run and cfg.get("push_manual", True) and pending_manual_rows:
+        try:
+            manual_push = monitor.push_manual_review_wecom(config, pending_manual_rows, title="实时需人工研判告警")
+        except Exception as exc:
+            manual_push = {"sent": False, "error": str(exc)[:200]}
+
+    REPORT_DIR.mkdir(exist_ok=True)
+    DATA_DIR.mkdir(exist_ok=True)
+    stamp = now.strftime("%Y%m%d_%H%M%S")
+    jsonl_path = REPORT_DIR / f"cfw_alert_center_judgement_{stamp}.jsonl"
+    dispose_path = REPORT_DIR / f"cfw_realtime_disposition_{stamp}.json"
+    write_jsonl(jsonl_path, judged_rows)
+
+    if not dry_run:
+        by_id = {row.get("告警ID"): row for row in judged_rows}
+        for record in new_records:
+            event_id = _record_id(record)
+            if event_id:
+                row = by_id.get(event_id) or {}
+                processed[event_id] = {
+                    "time": now_text,
+                    "result": row.get("模型研判", ""),
+                    "source": row.get("研判来源", ""),
+                }
+        state["processed"] = processed
+        for row in pending_manual_rows:
+            event_id = str(row.get("告警ID") or "")
+            if event_id:
+                notified[event_id] = {
+                    "time": now_text,
+                    "sent": bool(manual_push.get("sent")),
+                    "result": row.get("模型研判", ""),
+                }
+        state["manual_notified"] = notified
+        _save_realtime_state(config, state)
+
+    result.update({
+        "alert_count": len(rows),
+        "judgement_counts": dict(Counter(row.get("模型研判", "") for row in judged_rows)),
+        "whitelist_hit_events": len(white_rows),
+        "custom_rule_hits": len(custom_judgements),
+        "ignore_event_ids": len(set(ignore_ids)),
+        "manual_candidates": len(manual_rows),
+        "manual_pending_push": len(pending_manual_rows),
+        "manual_push": manual_push,
+        "white_actions": white_actions,
+        "omit_actions": omit_actions,
+        "judgement_jsonl": str(jsonl_path),
+    })
+    dispose_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    result["disposition_file"] = str(dispose_path)
+    monitor.append_jsonl(
+        DATA_DIR / f"realtime-poll-{now.strftime('%Y-%m-%d')}.jsonl",
+        [dict(result, recorded_at=now_text)],
+    )
+    return result
+
+
+def realtime_poll_loop(config, dry_run=False, interval_seconds=None, max_rounds=0):
+    cfg = _realtime_config(config)
+    interval = int(interval_seconds or cfg.get("interval_seconds", 60))
+    rounds = 0
+    while True:
+        try:
+            result = realtime_triage_once(config, dry_run=dry_run)
+        except Exception as exc:
+            result = {
+                "mode": "realtime_triage_once",
+                "dry_run": dry_run,
+                "error": str(exc)[:1000],
+                "recorded_at": monitor.dt_text(monitor.now_local()),
+            }
+            monitor.append_jsonl(
+                DATA_DIR / f"realtime-poll-{monitor.now_local().strftime('%Y-%m-%d')}.jsonl",
+                [result],
+            )
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        rounds += 1
+        if max_rounds and rounds >= max_rounds:
+            return
+        time.sleep(max(5, interval))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Triage and dispose Tencent CFW alert center events.")
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--start")
     parser.add_argument("--end")
     parser.add_argument("--safe-hourly", action="store_true")
+    parser.add_argument("--realtime-once", action="store_true", help="轮询窗口内只研判新告警一次")
+    parser.add_argument("--poll", action="store_true", help="常驻轮询实时研判")
+    parser.add_argument("--interval-seconds", type=int)
+    parser.add_argument("--lookback-minutes", type=int)
+    parser.add_argument("--max-rounds", type=int, default=0, help="轮询测试用:跑 N 轮后退出,0 表示常驻")
+    parser.add_argument("--reset-realtime-state", action="store_true")
     parser.add_argument("--recover", action="store_true",
                         help="AI 重新接入后,对降级兜底队列复判(轻量,可频繁调度)")
     parser.add_argument("--dry-run", action="store_true")
@@ -988,8 +1593,30 @@ def main():
     args = parser.parse_args()
 
     config = monitor.load_config()
+    if args.lookback_minutes or args.interval_seconds:
+        config.setdefault("realtime_triage", {})
+        if args.lookback_minutes:
+            config["realtime_triage"]["lookback_minutes"] = args.lookback_minutes
+        if args.interval_seconds:
+            config["realtime_triage"]["interval_seconds"] = args.interval_seconds
+    if args.reset_realtime_state:
+        try:
+            _realtime_state_path(config).unlink()
+        except FileNotFoundError:
+            pass
     if args.recover:
         print(json.dumps(recover_degraded_queue(config, args.dry_run), ensure_ascii=False))
+        return
+    if args.realtime_once:
+        print(json.dumps(realtime_triage_once(config, args.dry_run), ensure_ascii=False))
+        return
+    if args.poll:
+        realtime_poll_loop(
+            config,
+            dry_run=args.dry_run,
+            interval_seconds=args.interval_seconds,
+            max_rounds=max(0, int(args.max_rounds or 0)),
+        )
         return
     if args.safe_hourly:
         end = args.end or monitor.dt_text(monitor.now_local())
@@ -1021,9 +1648,11 @@ def main():
         retry_queue = None
 
     rows = [record_to_judge_row(record, labels, config) for record in records]
+    custom_judgements = apply_custom_rules_to_rows(rows)
     white_rows = [row for row in rows if row["_white_hits"]]
-    llm_rows = [row for row in rows if not row["_white_hits"]]
+    llm_rows = [row for row in rows if not row["_white_hits"] and row["告警ID"] not in custom_judgements]
     judgements = {row["告警ID"]: deterministic_white_judgement(row, model) for row in white_rows}
+    judgements.update(custom_judgements)
 
     # 业务误报记忆短路(与 deep_triage_records 同口径):命中即定业务误报,跳过 LLM。
     try:
@@ -1056,6 +1685,7 @@ def main():
         llm_rows = remaining
 
     judgements.update(monitor.llm_judge_rows(config, llm_rows))
+    attach_policy_fields(judgements, rows)
 
     # 写回业务误报内容记忆(本轮模型判为业务误报的)
     if triage_memory:
@@ -1073,23 +1703,7 @@ def main():
                         pass
 
     judged_rows = apply_judgements(rows, judgements)
-    # 高危更严:仅当模型明确判"确认未成功/扫描探测"且置信非低才忽略;"未见成功证据"
-    # 这种存疑结论对高危保留人工。与小时任务 safe_hourly 的高危处置口径一致。
-    def _can_ignore(row):
-        result = row.get("模型研判")
-        if result not in IGNORE_RESULTS or not row.get("告警ID"):
-            return False
-        if row.get("告警等级") == "高危":
-            # 高危可忽略的无害结论:确认未成功/扫描探测/业务误报(后者须有源包支撑)
-            if result not in ("确认未成功", "扫描探测", "业务误报"):
-                return False
-            if row.get("模型置信度") == "低":
-                return False
-            if result == "业务误报" and not (row.get("关键证据") or row.get("源包证据")):
-                return False
-        return True
-
-    ignore_ids = [row["告警ID"] for row in judged_rows if _can_ignore(row)]
+    ignore_ids = [row["告警ID"] for row in judged_rows if can_ignore_judged_row(row, records, judgements)]
     candidates = white_rule_candidates(rows)
 
     # 重试队列维护:降级(连接异常/解析失败)的入队,等下次网络好时 Agent 补判;
@@ -1160,9 +1774,8 @@ def main():
     if not args.dry_run:
         white_actions = allow_scanner_ips(config, rows)
         omit_actions = omit_alert_center_events(config, ignore_ids, int((config.get("llm") or {}).get("auto_dispose", {}).get("batch_size", 50)))
-        # 企微 bot 专推"需人工复核"+"确认成功"并 @所有人;小时/日报汇总不受影响
-        manual_results = {"需人工复核", "确认成功"}
-        manual_rows = [row for row in judged_rows if row.get("模型研判") in manual_results]
+        # 企微 bot 专推未被自动忽略的留存项并 @所有人;小时/日报汇总不受影响
+        manual_rows = manual_review_candidates(judged_rows, ignore_ids)
         if manual_rows:
             try:
                 manual_push = monitor.push_manual_review_wecom(config, manual_rows)
@@ -1180,6 +1793,7 @@ def main():
         "alert_count": len(rows),
         "judgement_counts": dict(Counter(row.get("模型研判", "") for row in judged_rows)),
         "whitelist_hit_events": len(white_rows),
+        "custom_rule_hits": len(custom_judgements),
         "white_rule_candidates": len(candidates),
         "ignore_event_ids": len(set(ignore_ids)),
         "white_actions": white_actions,

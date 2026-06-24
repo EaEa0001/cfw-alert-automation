@@ -6,12 +6,21 @@
   ],
   "tencent_scan_ips": [],
   "company_scan_ips": [],
+  "block_ip": {
+    "enabled": true,
+    "direction_list": "0,1",
+    "end_time": "2099-12-31 23:59:59",
+    "fw_type": 1,
+    "cover_duplicate": 1,
+    "batch_size": 50,
+    "comment_prefix": "cfw-alert-automation"
+  },
   "lookback_hours": 1,
   "daily_report_time": "17:50",
   "wecom": {
     "enabled": false,
     "webhook_url": "",
-    "hourly_enabled": true,
+    "hourly_enabled": false,
     "daily_enabled": true,
     "notify_on_empty": true,
     "timeout_seconds": 15,
@@ -20,7 +29,18 @@
     "manual_at_all": true,
     "manual_max_items": 6,
     "manual_webhook_url": "",
-    "hourly_at_all_on_critical": true
+    "hourly_at_all_on_critical": false
+  },
+  "realtime_triage": {
+    "enabled": true,
+    "interval_seconds": 60,
+    "lookback_minutes": 10,
+    "max_records_per_round": 80,
+    "dedupe_hours": 24,
+    "manual_notify_cooldown_minutes": 240,
+    "auto_dispose": true,
+    "push_manual": true,
+    "state_file": "data/realtime-poll-state.json"
   },
   "llm": {
     "enabled": true,
@@ -29,6 +49,73 @@
     "reasoning_effort": "medium",
     "codex_responses_url": "https://chatgpt.com/backend-api/codex/responses",
     "codex_path": "codex.cmd",
+    "rule_parse": {
+      "enabled": true,
+      "timeout_seconds": 90
+    },
+    "routing": {
+      "batch_triage": "codex_direct",
+      "source_review": "codex_direct",
+      "agent_triage": "codex_direct",
+      "critical_review": "codex_direct",
+      "rule_parse": "codex_direct",
+      "fallback": "codex_direct"
+    },
+    "providers": {
+      "codex_direct": {
+        "type": "codex_direct",
+        "model": "gpt-5.5",
+        "url": "https://chatgpt.com/backend-api/codex/responses",
+        "reasoning_effort": "high",
+        "timeout_seconds": 300
+      },
+      "codex_api": {
+        "type": "openai_compatible",
+        "base_url": "https://api.openai.com/v1",
+        "api_key_env": "OPENAI_API_KEY",
+        "model": "gpt-5.5",
+        "json_mode": true,
+        "timeout_seconds": 300
+      },
+      "deepseek_fast": {
+        "type": "openai_compatible",
+        "base_url": "https://api.deepseek.com",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "model": "deepseek-v4-flash",
+        "json_mode": true,
+        "timeout_seconds": 180
+      },
+      "deepseek_reasoner": {
+        "type": "openai_compatible",
+        "base_url": "https://api.deepseek.com",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "model": "deepseek-v4-pro",
+        "json_mode": true,
+        "reasoning_effort": "high",
+        "timeout_seconds": 240
+      },
+      "glm_fast": {
+        "type": "openai_compatible",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "api_key_env": "GLM_API_KEY",
+        "model": "glm-5.2",
+        "json_mode": true,
+        "timeout_seconds": 180
+      },
+      "claude_api": {
+        "type": "anthropic",
+        "api_key_env": "ANTHROPIC_API_KEY",
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 4096,
+        "timeout_seconds": 240
+      },
+      "claude_subscription": {
+        "type": "claude_cli",
+        "command": ["claude", "-p", "--output-format", "text"],
+        "model": "claude-code-subscription",
+        "timeout_seconds": 240
+      }
+    },
     "max_workers": 3,
     "batch_size": 40,
     "timeout_seconds": 300,
@@ -82,5 +169,18 @@
     "precheck": true,
     "precheck_timeout": 6,
     "proxy": ""
+  },
+  "agent": {
+    "enabled": false,
+    "policy_guard": {
+      "high_alert_requires_evidence": true,
+      "cloud_success_never_omit": true,
+      "confirmed_success_never_omit": true
+    },
+    "custom_rules": {
+      "enabled": true,
+      "default_expire_days": 30,
+      "require_confirm": true
+    }
   }
 }

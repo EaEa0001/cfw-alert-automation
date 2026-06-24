@@ -75,7 +75,7 @@ CFW.DEMO = {
 
   // —— 三层漏斗 + 流水线 ——（由 triage_stats 派生）
   funnel: [
-    { key: "raw",   label: "原始流量 / 检测事件", n: 12418, note: "全流量检测与响应日志(上一小时)", tone: "primary" },
+    { key: "raw",   label: "原始流量 / 检测事件", n: 12418, note: "实时轮询告警中心,小时任务仅采集日志", tone: "primary" },
     { key: "noise", label: "排除扫描噪声", n: 3847, note: "剔除腾讯云暴露面扫描 21 IP + 公司漏扫 1 IP", tone: "primary", drop: "入库告警" },
     { key: "l0",    label: "第 0 层 · 确定性定性", n: 1920, note: "白名单扫描源 / 云端确认 / 高危直定，0 token", tone: "ok" },
     { key: "l1",    label: "第 1 层 · 规则过筛", n: 1402, note: "源包完整且响应全 4xx 失败 / 纯扫描器特征", tone: "ok" },
@@ -85,13 +85,30 @@ CFW.DEMO = {
   ],
 
   pipeline: [
-    { t: "每小时采集", d: "拉取上一小时全流量检测与响应日志", icon: "collect" },
+    { t: "实时轮询", d: "默认每 60 秒拉取告警中心新事件", icon: "collect" },
     { t: "排除噪声", d: "剔除腾讯云扫描 IP 与公司漏扫 IP", icon: "filter" },
     { t: "三层漏斗研判", d: "确定性 → 规则过筛 → 源包深度 → Agent 循环", icon: "funnel" },
     { t: "自动处置", d: "扫描/确认失败/未见成功证据 → 自动忽略加白", icon: "auto" },
     { t: "企微通知", d: "需人工 / 确认成功推卡片 + @所有人", icon: "notify" },
-    { t: "每日报告", d: "唯一告警、攻击源、等级与研判分布汇总", icon: "report" }
+    { t: "17:50 日报", d: "唯一告警、攻击源、等级与研判分布汇总", icon: "report" }
   ],
+
+  pipelineStatus: {
+    config: { realtime_enabled: false, interval_seconds: 60, lookback_minutes: 10, auto_dispose: true, push_manual: true, daily_report_time: "17:50" },
+    last_round: {},
+    active_round: {},
+    recent_rounds: [],
+    totals: {},
+    state: {},
+    latest_wecom: {}
+  },
+
+  whitelistConfig: {
+    tencent_scan_ips: [],
+    company_scan_ips: [],
+    whitelist_ips: [],
+    counts: { tencent_scan_ips: 0, company_scan_ips: 0, total: 0 }
+  },
 
   // —— 攻击来源 TOP —— ← /api/attacker_rank
   attackerRank: [
@@ -144,28 +161,28 @@ CFW.DEMO = {
   // —— 攻击者画像 —— ← /api/profiles
   profiles: [
     { ip:"10.12.7.34", internal:true, band:"高危", score:84, type:"内网横向", intent:"扩大据点 / 提权",
-      stage:"利用", killchainMax:"利用",
+      stage:"横向扩散", killchainMax:"横向扩散",
       narrative:"先对 3 台内网主机做 SMB / WMI 探测，随后尝试 Pass-the-Hash 横向，在 10.12.7.50 触发命令执行并取得 root 回显——已得手，正向纵深扩散。",
       events:{"SMB探测":12,"WMI执行":5,"Pass-the-Hash":3,"命令执行":2},
       alertCount:22, techniques:4, targets:3, span:6, high:7, success:1, country:"内网",
       first:"2026-06-22 08:40", last:"2026-06-22 14:21",
       rec:"立即隔离 10.12.7.34 与 10.12.7.50，重置相关凭据，排查 PtH 来源主机。" },
     { ip:"45.143.166.21", internal:false, band:"高危", score:76, type:"漏洞利用", intent:"Web 资产突破",
-      stage:"投递", killchainMax:"利用",
+      stage:"落地驻留", killchainMax:"落地驻留",
       narrative:"持续扫描 Web 暴露面后锁定目标，先后投递 Log4j JNDI 与 WebShell，oa-portal 上 WebShell 落地成功，对 web-api 的 Log4j 利用未见回显。",
       events:{"Web扫描":140,"Log4j利用":42,"WebShell上传":11,"目录遍历":18},
       alertCount:318, techniques:6, targets:4, span:9, high:4, success:1, country:"荷兰",
       first:"2026-06-22 06:10", last:"2026-06-22 14:48",
       rec:"封禁来源 IP，下线 oa-portal WebShell，全量排查 Log4j 组件版本。" },
     { ip:"172.16.4.9", internal:true, band:"关注", score:69, type:"异常外联", intent:"疑似 C2 回连",
-      stage:"命令控制", killchainMax:"命令控制",
+      stage:"控制回连", killchainMax:"控制回连",
       narrative:"内网主机周期性向境外固定 IP 发起等长心跳，疑似已被植入 Beacon，但 TLS 密文无法解码，尚无落地证据。",
       events:{"异常外联":41,"DNS异常":8,"等长心跳":33},
       alertCount:41, techniques:3, targets:1, span:11, high:3, success:0, country:"内网",
       first:"2026-06-22 03:20", last:"2026-06-22 14:30",
       rec:"抓取该主机全量外连，比对威胁情报，必要时断网取证。" },
     { ip:"193.56.29.110", internal:false, band:"一般", score:38, type:"扫描器", intent:"无差别测绘",
-      stage:"侦察", killchainMax:"侦察",
+      stage:"探测", killchainMax:"探测",
       narrative:"大规模端口与指纹扫描，覆盖多个资产，响应全部 4xx，典型无差别扫描器，无后续利用动作。",
       events:{"端口扫描":820,"指纹识别":320,"目录探测":100},
       alertCount:1240, techniques:2, targets:18, span:24, high:0, success:0, country:"俄罗斯",
@@ -217,9 +234,11 @@ CFW.countUp = (node, target, dur = 900, fmt = CFW.fmt) => {
 
 // 迷你 sparkline (SVG polyline)
 CFW.sparkline = (data, w = 78, h = 30, color = "var(--primary)") => {
-  const min = Math.min(...data), max = Math.max(...data), rng = max - min || 1;
-  const pts = data.map((v, i) => {
-    const x = (i / (data.length - 1)) * w;
+  const values = (data || []).map(Number).filter(Number.isFinite);
+  if (values.length < 2) return "";
+  const min = Math.min(...values), max = Math.max(...values), rng = max - min || 1;
+  const pts = values.map((v, i) => {
+    const x = (i / (values.length - 1)) * w;
     const y = h - 3 - ((v - min) / rng) * (h - 6);
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(" ");

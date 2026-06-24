@@ -1,7 +1,33 @@
 /* ===== 视图：攻击者画像 ===== */
 (function () {
   const { esc, fmt } = CFW;
-  const CHAIN = ["侦察", "武器化", "投递", "利用", "安装", "命令控制", "行动"];
+  const CHAIN = ["探测", "尝试利用", "成功利用", "落地驻留", "控制回连", "横向扩散", "外传/破坏"];
+  const STAGE_ALIAS = {
+    "": "探测",
+    "无": "探测",
+    "侦察": "探测",
+    "侦察扫描": "探测",
+    "扫描探测": "探测",
+    "武器化": "尝试利用",
+    "投递": "尝试利用",
+    "利用": "尝试利用",
+    "漏洞利用": "尝试利用",
+    "利用尝试": "尝试利用",
+    "已利用": "成功利用",
+    "利用成功": "成功利用",
+    "安装": "落地驻留",
+    "落地": "落地驻留",
+    "落地执行": "落地驻留",
+    "命令控制": "控制回连",
+    "控制": "控制回连",
+    "横向": "横向扩散",
+    "横向移动": "横向扩散",
+    "数据窃取": "外传/破坏",
+    "影响破坏": "外传/破坏",
+    "外传破坏": "外传/破坏",
+    "数据/破坏": "外传/破坏",
+    "行动": "外传/破坏"
+  };
   const bandColor = { "高危": "var(--danger)", "关注": "var(--warn)", "一般": "var(--text-dim)" };
 
   CFW.renderAttackers = function () {
@@ -23,8 +49,12 @@
       </div>`;
   };
 
+  function stageLabel(value) {
+    return STAGE_ALIAS[value] || value || "探测";
+  }
+
   function chainTrack(stageMax) {
-    const idx = CHAIN.indexOf(stageMax);
+    const idx = Math.max(0, CHAIN.indexOf(stageLabel(stageMax)));
     return `<div class="chain">${CHAIN.map((s, i) => `
       <div class="chain-node ${i <= idx ? "on" : ""} ${i === idx ? "cur" : ""}">
         <span class="cn-dot"></span><span class="cn-t">${s}</span>
@@ -33,6 +63,8 @@
 
   function card(p) {
     const c = bandColor[p.band];
+    const stage = stageLabel(p.stage);
+    const chainMax = stageLabel(p.killchainMax);
     const evs = Object.entries(p.events).sort((a, b) => b[1] - a[1])
       .map(([k, v]) => `<span class="chip">${esc(k)}<span class="x">×${v}</span></span>`).join("");
     return `<div class="atk-card" style="--c:${c}">
@@ -49,8 +81,8 @@
 
       <div class="atk-narr">${esc(p.narrative)}</div>
 
-      <div class="atk-lab">杀伤链阶段 · 当前 <b style="color:${c}">${esc(p.stage)}</b></div>
-      ${chainTrack(p.killchainMax)}
+      <div class="atk-lab">攻击阶段 · 当前 <b style="color:${c}">${esc(stage)}</b></div>
+      ${chainTrack(chainMax)}
 
       <div class="atk-stats">
         <div><span class="mut">告警</span><b>${p.alertCount}</b></div>

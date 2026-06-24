@@ -1889,6 +1889,17 @@ def parse_codex_direct_usage(usage):
     }
 
 
+def normalize_llm_usage(usage):
+    usage = usage or {}
+    output_details = usage.get("output_tokens_details") or {}
+    return {
+        "input_tokens": usage.get("input_tokens", usage.get("prompt_tokens", "")),
+        "output_tokens": usage.get("output_tokens", usage.get("completion_tokens", "")),
+        "reasoning_output_tokens": output_details.get("reasoning_tokens", usage.get("reasoning_tokens", "")),
+        "total_tokens": usage.get("total_tokens", ""),
+    }
+
+
 def extract_completed_output(response):
     parts = []
     for item in response.get("output") or []:
@@ -2034,6 +2045,90 @@ def call_codex_direct_batch(config, model, batch):
             by_key[str(key)] = item
     usage["elapsed_seconds"] = round(time.perf_counter() - started, 3)
     usage["response_id"] = response_id
+    return by_key, usage
+
+
+def router_enabled(config):
+    return bool((config.get("llm") or {}).get("providers"))
+
+
+def router_provider_meta(config, stage):
+    from agent.llm.router import LLMRouter
+    router = LLMRouter(config)
+    name = router.provider_name_for(stage)
+    cfg = router.providers.get(name) or {}
+    return router, name, cfg
+
+
+def _codex_legacy_config_for_provider(config, provider_cfg):
+    llm = dict(config.get("llm") or {})
+    if provider_cfg.get("url"):
+        llm["codex_responses_url"] = provider_cfg.get("url")
+    if provider_cfg.get("reasoning_effort"):
+        llm["reasoning_effort"] = provider_cfg.get("reasoning_effort")
+    if provider_cfg.get("timeout_seconds"):
+        llm["timeout_seconds"] = provider_cfg.get("timeout_seconds")
+    new_config = dict(config)
+    new_config["llm"] = llm
+    return new_config
+
+
+def _model_from_provider(config, stage, fallback_model):
+    _, _, provider_cfg = router_provider_meta(config, stage)
+    return str(provider_cfg.get("model") or fallback_model)
+
+
+def call_router_batch(config, stage, batch):
+    """Call the configured provider route for a normal/source-review JSON batch."""
+    router, provider_name, provider_cfg = router_provider_meta(config, stage)
+    typ = str(provider_cfg.get("type") or "").lower()
+    model = str(provider_cfg.get("model") or (config.get("llm") or {}).get("model", ""))
+    if typ in {"codex_direct", "codex_subscription"}:
+        if stage == "source_review":
+            return call_codex_direct_source_batch(_codex_legacy_config_for_provider(config, provider_cfg), model, batch)
+        return call_codex_direct_batch(_codex_legacy_config_for_provider(config, provider_cfg), model, batch)
+
+    started = time.perf_counter()
+    if stage == "source_review":
+        source_cfg = (config.get("llm") or {}).get("source_review") or {}
+        id_map = {}
+        prompt = source_review_prompt(batch, id_map, int(source_cfg.get("max_evidence_chars", 420)))
+        system = "你是安全告警源包复核助手。只输出符合用户要求的紧凑 JSON 数组。"
+    else:
+        id_map = {}
+        prompt = codex_direct_prompt(batch, id_map)
+        system = "你是安全告警复核助手。只输出符合用户要求的紧凑 JSON 数组。"
+
+    response = router.complete_json(stage, prompt, system=system)
+    parsed = parse_llm_json(response.text)
+    results = extract_llm_results(parsed)
+    usage = normalize_llm_usage(response.usage)
+    usage["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+    usage["provider"] = provider_name
+    usage["model"] = response.model or model
+
+    by_key = {}
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        try:
+            mapped_key = id_map.get(int(item.get("id")))
+        except Exception:
+            mapped_key = None
+        key = mapped_key or item.get("告警ID") or item.get("攻击IP")
+        if not key:
+            continue
+        normalized = {
+            "模型研判": normalize_direct_result(item.get("result") or item.get("模型研判")),
+            "模型置信度": normalize_confidence(item.get("confidence") or item.get("模型置信度")),
+            "研判理由": str(item.get("evidence") or item.get("研判理由") or "")[:120],
+            "下一步": str(item.get("next") or item.get("下一步") or "")[:80],
+            "关键证据": str(item.get("key_evidence") or item.get("关键证据") or "")[:160],
+            "_provider": provider_name,
+            "_model": response.model or model,
+            "_usage": usage,
+        }
+        by_key[str(key)] = normalized
     return by_key, usage
 
 
@@ -2502,9 +2597,124 @@ def _parse_agent_final(text):
     }
 
 
+def _generic_agent_system():
+    tool_names = ", ".join(sorted(TOOL_DISPATCH))
+    return (
+        "你是资深安全告警研判员。你可以通过 JSON 工具协议取证。"
+        "每轮只能输出一个紧凑 JSON 对象,不要 Markdown,不要解释。"
+        "若还需要取证,输出:"
+        "{\"tool_call\":{\"name\":\"工具名\",\"args\":{...},\"reason\":\"为什么调用\"}}。"
+        f"可用工具:{tool_names}。"
+        "若证据足够或已到最后一轮,输出最终结论 JSON:"
+        "{\"result\":\"确认成功/确认未成功/未见成功证据/扫描探测/业务误报/需人工复核\","
+        "\"confidence\":\"high/medium/low\",\"evidence\":\"≤40汉字\","
+        "\"next\":\"≤20汉字\",\"key_evidence\":\"≤120字符\"}。"
+        "必须基于工具结果中的真实证据判断;确认成功必须有命令回显、webshell、敏感数据返回、"
+        "文件落地或回连等明确落地证据。单独 HTTP 200、普通页面、业务接口调用不算成功。"
+        "业务误报=正常业务数据被规则误命中;未见成功证据=确有攻击 payload 但无得手证据。"
+    )
+
+
+def _generic_agent_prompt(seed, tool_results, last_round=False):
+    payload = {
+        "alert": seed,
+        "tool_results": tool_results[-8:],
+        "last_round": bool(last_round),
+    }
+    suffix = "这是最后一轮,必须输出最终结论,不能再调用工具。" if last_round else "先决定是否还需要调用工具取证。"
+    return "研判这条云防火墙告警。" + suffix + "输入=" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _parse_generic_agent_tool_call(parsed):
+    if isinstance(parsed, list):
+        parsed = parsed[0] if parsed else {}
+    if not isinstance(parsed, dict):
+        return None
+    call = parsed.get("tool_call") or parsed.get("tool") or parsed.get("function_call")
+    if isinstance(call, dict):
+        name = call.get("name") or call.get("tool") or call.get("function")
+        args = call.get("args") or call.get("arguments") or {}
+    elif isinstance(call, str):
+        name = call
+        args = parsed.get("args") or parsed.get("arguments") or {}
+    else:
+        name = parsed.get("tool_name") or parsed.get("name") if parsed.get("action") == "tool_call" else ""
+        args = parsed.get("args") or parsed.get("arguments") or {}
+    if not name:
+        return None
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            args = {}
+    return {"name": str(name), "args": args if isinstance(args, dict) else {}}
+
+
+def run_router_agent_triage(config, record, row, max_rounds=6):
+    """Provider-neutral JSON tool loop for non-Codex-native agent routes."""
+    router, provider_name, provider_cfg = router_provider_meta(config, "agent_triage")
+    model = str(provider_cfg.get("model") or (config.get("llm") or {}).get("model", ""))
+    # If the route explicitly points to Codex subscription, keep using the
+    # mature native function-calling implementation and its existing retries.
+    if str(provider_cfg.get("type") or "").lower() in {"codex_direct", "codex_subscription"}:
+        return run_codex_agent_triage(_codex_legacy_config_for_provider(config, provider_cfg), record, row, model, max_rounds=max_rounds)
+
+    seed = {
+        "告警ID": row.get("告警ID"),
+        "事件名称": row.get("事件名称"),
+        "告警等级": row.get("告警等级"),
+        "攻击IP": row.get("攻击IP"),
+        "目标IP": row.get("目标IP"),
+        "威胁描述": row.get("威胁描述"),
+        "源包证据": row.get("源包证据") if isinstance(row.get("源包证据"), dict) else {},
+        "初判结果": row.get("模型研判"),
+        "初判理由": row.get("研判理由"),
+    }
+    tool_results = []
+    tool_trace = []
+    agg_usage = {"input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0}
+    for round_idx in range(int(max_rounds)):
+        last_round = round_idx == int(max_rounds) - 1
+        response = router.complete_json(
+            "agent_triage",
+            _generic_agent_prompt(seed, tool_results, last_round=last_round),
+            system=_generic_agent_system(),
+        )
+        usage = normalize_llm_usage(response.usage)
+        for k in agg_usage:
+            try:
+                agg_usage[k] += int(usage.get(k) or 0)
+            except (TypeError, ValueError):
+                pass
+        try:
+            parsed = parse_llm_json(response.text)
+        except Exception:
+            append_llm_error(provider_name + "_agent_parse", model, [row], RuntimeError(response.text[:500]))
+            return None
+        call = None if last_round else _parse_generic_agent_tool_call(parsed)
+        if call:
+            result = dispatch_tool(call["name"], call["args"], config, record)
+            tool_trace.append({"tool": call["name"], "args": call["args"]})
+            tool_results.append({"tool": call["name"], "args": call["args"], "result": result})
+            continue
+        parsed_result = _parse_agent_final(json.dumps(parsed, ensure_ascii=False))
+        if not parsed_result:
+            return None
+        parsed_result["研判来源"] = provider_name + "_agent"
+        parsed_result["研判模型"] = response.model or model
+        parsed_result["工具轨迹"] = ";".join(t["tool"] for t in tool_trace)
+        parsed_result["输入Token"] = str(agg_usage["input_tokens"])
+        parsed_result["输出Token"] = str(agg_usage["output_tokens"])
+        parsed_result["推理Token"] = str(agg_usage["reasoning_output_tokens"])
+        return parsed_result
+    return None
+
+
 def source_review_enabled(config):
     llm = config.get("llm") or {}
     source_cfg = llm.get("source_review") or {}
+    if router_enabled(config):
+        return bool(source_cfg.get("enabled", True))
     return llm.get("provider") == "codex_direct" and bool(source_cfg.get("enabled", True))
 
 
@@ -2729,13 +2939,18 @@ def refine_judgements_with_source(config, rows, judgements, model):
     batches = [group_rows[i : i + batch_size] for i in range(0, len(group_rows), batch_size)]
     group_results = {}
     with ThreadPoolExecutor(max_workers=max(1, int(llm.get("max_workers", 3)))) as executor:
-        future_map = {executor.submit(call_codex_direct_source_batch, config, model, batch): batch for batch in batches}
+        if router_enabled(config):
+            routed_model = _model_from_provider(config, "source_review", model)
+            future_map = {executor.submit(call_router_batch, config, "source_review", batch): batch for batch in batches}
+        else:
+            routed_model = model
+            future_map = {executor.submit(call_codex_direct_source_batch, config, model, batch): batch for batch in batches}
         for future in as_completed(future_map):
             batch = future_map[future]
             try:
                 by_group, usage = future.result()
             except Exception as exc:
-                append_llm_error("source_review", model, batch, exc)
+                append_llm_error("source_review", routed_model, batch, exc)
                 continue
             for group_key, item in by_group.items():
                 item["_usage"] = usage
@@ -2761,8 +2976,8 @@ def refine_judgements_with_source(config, rows, judgements, model):
                 "研判理由": model_reason,
                 "下一步": item.get("下一步", current.get("下一步", "")),
                 "关键证据": item.get("关键证据", current.get("关键证据", "")),
-                "研判来源": "codex_direct_source",
-                "研判模型": model,
+                "研判来源": (item.get("_provider") + "_source") if item.get("_provider") else "codex_direct_source",
+                "研判模型": item.get("_model") or routed_model,
                 "输入Token": str((item.get("_usage") or {}).get("input_tokens", current.get("输入Token", ""))),
                 "输出Token": str((item.get("_usage") or {}).get("output_tokens", current.get("输出Token", ""))),
                 "推理Token": str((item.get("_usage") or {}).get("reasoning_output_tokens", current.get("推理Token", ""))),
@@ -2798,9 +3013,18 @@ def llm_judge_rows(config, rows):
         return {judgement_key(row): fallback_judgement(row, "rule_fallback_llm_disabled", model) for row in rows}
 
     provider = llm.get("provider", "codex_cli")
+    routed_batch = router_enabled(config)
+    if routed_batch:
+        try:
+            _, route_provider, route_cfg = router_provider_meta(config, "batch_triage")
+            provider = route_provider
+            model = str(route_cfg.get("model") or model)
+        except Exception as exc:
+            append_llm_error("router", model, [], exc)
+            return {judgement_key(row): fallback_judgement(row, "rule_fallback_router_config_error", model) for row in rows}
     # 连接预检:provider 为 codex_direct 且接口不可达时,整轮短路,全部降级
     # (避免每条干等超时;这些会被上层重试队列接住,网络恢复时补判)。
-    if provider == "codex_direct" and llm.get("precheck", True):
+    if provider == "codex_direct" and not routed_batch and llm.get("precheck", True):
         if not codex_reachable(config, timeout=int(llm.get("precheck_timeout", 6))):
             append_llm_error("precheck", model, [], RuntimeError("codex unreachable, skip LLM this run"))
             return {judgement_key(row): fallback_judgement(row, "rule_fallback_codex_unreachable", model) for row in rows}
@@ -2809,7 +3033,9 @@ def llm_judge_rows(config, rows):
     batches = [rows[i : i + batch_size] for i in range(0, len(rows), batch_size)]
     results = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        if provider == "codex_direct":
+        if routed_batch:
+            future_map = {executor.submit(call_router_batch, config, "batch_triage", batch): batch for batch in batches}
+        elif provider == "codex_direct":
             future_map = {executor.submit(call_codex_direct_batch, config, model, batch): batch for batch in batches}
         elif provider == "codex_cli":
             future_map = {executor.submit(call_codex_batch, config, model, batch): batch for batch in batches}
@@ -2832,7 +3058,7 @@ def llm_judge_rows(config, rows):
             batch = future_map[future]
             try:
                 future_result = future.result()
-                if provider in ("codex_cli", "codex_direct"):
+                if routed_batch or provider in ("codex_cli", "codex_direct"):
                     by_key, usage = future_result
                 else:
                     by_key, usage = future_result, {}
@@ -2848,9 +3074,12 @@ def llm_judge_rows(config, rows):
                     confidence = str(item.get("模型置信度") or item.get("confidence") or "中")
                     reason = str(item.get("研判理由") or item.get("evidence") or "")
                     next_step = str(item.get("下一步") or item.get("next") or row.get("本地建议") or row.get("建议处置") or "")
-                    if provider == "codex_direct":
+                    if provider == "codex_direct" or routed_batch:
                         judgement = normalize_direct_result(judgement)
                         confidence = normalize_confidence(confidence)
+                    item_usage = item.get("_usage") or usage or {}
+                    item_provider = item.get("_provider") or provider
+                    item_model = item.get("_model") or model
                     results[key] = {
                         "告警ID": key if row.get("告警ID") else "",
                         "攻击IP": row.get("攻击IP", ""),
@@ -2859,11 +3088,11 @@ def llm_judge_rows(config, rows):
                         "研判理由": reason,
                         "关键证据": str(item.get("关键证据") or ""),
                         "下一步": next_step,
-                        "研判来源": provider,
-                        "研判模型": model,
-                        "输入Token": str((usage or {}).get("input_tokens", "")),
-                        "输出Token": str((usage or {}).get("output_tokens", "")),
-                        "推理Token": str((usage or {}).get("reasoning_output_tokens", "")),
+                        "研判来源": item_provider,
+                        "研判模型": item_model,
+                        "输入Token": str(item_usage.get("input_tokens", "")),
+                        "输出Token": str(item_usage.get("output_tokens", "")),
+                        "推理Token": str(item_usage.get("reasoning_output_tokens", "")),
                     }
                     # 写回记忆库(只存真模型结果,降级兜底不污染先验)
                     try:
@@ -2900,8 +3129,21 @@ def escalate_with_agent(config, rows, judgements, model):
     """
     llm = config.get("llm") or {}
     agent_cfg = llm.get("agent_triage") or {}
-    if not (llm.get("provider") == "codex_direct" and agent_cfg.get("enabled", False)):
+    if not agent_cfg.get("enabled", False):
         return judgements
+    routed_agent = router_enabled(config)
+    if not routed_agent and llm.get("provider") != "codex_direct":
+        return judgements
+    if routed_agent:
+        try:
+            _, agent_provider, agent_provider_cfg = router_provider_meta(config, "agent_triage")
+            agent_model = str(agent_provider_cfg.get("model") or model)
+        except Exception as exc:
+            append_llm_error("agent_router", model, [], exc)
+            return judgements
+    else:
+        agent_provider = "codex_agent"
+        agent_model = model
 
     # 小时任务有超时限制,Agent 多轮很慢,只升级最该查的少量;日报无紧超时可多。
     # HOURLY_MODE 由 safe_hourly 入口设置。
@@ -2927,16 +3169,22 @@ def escalate_with_agent(config, rows, judgements, model):
 
     record_by_key = {judgement_key(row): row.get("_record") for row in rows}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(run_codex_agent_triage, config, record_by_key.get(key) or {}, row, model): key
-            for key, row in targets
-        }
+        if routed_agent:
+            future_map = {
+                executor.submit(run_router_agent_triage, config, record_by_key.get(key) or {}, row, max_rounds=int(agent_cfg.get("max_rounds", 6))): key
+                for key, row in targets
+            }
+        else:
+            future_map = {
+                executor.submit(run_codex_agent_triage, config, record_by_key.get(key) or {}, row, model): key
+                for key, row in targets
+            }
         for future in as_completed(future_map):
             key = future_map[future]
             try:
                 agent_result = future.result()
             except Exception as exc:
-                append_llm_error("codex_agent", model, [], exc)
+                append_llm_error(agent_provider + "_agent", agent_model, [], exc)
                 continue
             if not agent_result:
                 continue
