@@ -296,6 +296,9 @@ class LocalCliProvider(LLMProvider):
         if not cmd:
             raise RuntimeError("empty command")
         full_prompt = (system.strip() + "\n\n" if system else "") + prompt
+        env = os.environ.copy()
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        env.setdefault("PYTHONUTF8", "1")
         proc = subprocess.run(
             cmd,
             input=full_prompt,
@@ -304,6 +307,7 @@ class LocalCliProvider(LLMProvider):
             timeout=timeout or float(self.config.get("timeout_seconds", 180)),
             encoding="utf-8",
             errors="replace",
+            env=env,
         )
         if proc.returncode != 0:
             raise RuntimeError((proc.stderr or proc.stdout or f"cli exited {proc.returncode}")[:800])
