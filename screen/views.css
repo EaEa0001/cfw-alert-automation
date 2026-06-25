@@ -865,6 +865,69 @@
   background: var(--muted);
 }
 
+.tencent-auth-box {
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--card);
+}
+
+.tencent-auth-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px 12px;
+  margin-top: 12px;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted-foreground);
+  background: var(--background);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.pill.ok {
+  border-color: color-mix(in srgb, var(--ok) 35%, var(--line));
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 10%, #ffffff);
+}
+
+.pill.warn {
+  border-color: color-mix(in srgb, var(--warn) 35%, var(--line));
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 10%, #ffffff);
+}
+
+.auth-profile-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.profile-chip {
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted-foreground);
+  background: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.profile-chip.ready {
+  border-color: color-mix(in srgb, var(--ok) 30%, var(--line));
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 8%, #ffffff);
+}
+
 .provider-template {
   max-width: 220px;
 }
@@ -1624,6 +1687,10 @@
 
   .provider-template {
     max-width: none;
+  }
+
+  .tencent-auth-grid {
+    grid-template-columns: 1fr;
   }
 
   .rule-tabs button,

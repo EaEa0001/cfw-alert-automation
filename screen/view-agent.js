@@ -102,6 +102,7 @@
     const providers = settings.providers || routing.providers || {};
     const health = agent.provider_health || {};
     const envStatus = settings.env || {};
+    const tencentAuth = agent.tencent_auth || {};
     const alerts = Array.isArray(CFW.DEMO.agentAlerts) ? CFW.DEMO.agentAlerts : [];
     const providerNames = Object.keys(providers);
     if (!selectedAlertId && alerts[0]) selectedAlertId = alerts[0]["告警ID"] || "";
@@ -127,6 +128,11 @@
           <button class="btn primary" id="saveLlmGlobalBtn">保存开关</button>
           <pre class="draft-box config-result">${configResult ? esc(JSON.stringify(configResult, null, 2)) : "等待配置变更..."}</pre>
         </div>
+      </div>
+
+      <div class="panel mt">
+        <h2>腾讯云鉴权 <span class="hint">AK/SK 优先,也兼容服务器上的 tccli profile</span></h2>
+        ${tencentAuthPanel(tencentAuth)}
       </div>
 
       <div class="panel mt">
@@ -184,6 +190,8 @@
     if (policyPreview) policyPreview.addEventListener("click", () => previewTriage(false));
     const agentPreview = CFW.$("#agentPreviewBtn", root);
     if (agentPreview) agentPreview.addEventListener("click", () => previewTriage(true));
+    const saveTencentAuth = CFW.$("#saveTencentAuthBtn", root);
+    if (saveTencentAuth) saveTencentAuth.addEventListener("click", saveTencentAuthConfig);
     const templateSelect = CFW.$("#newProviderTemplate", root);
     if (templateSelect) templateSelect.addEventListener("change", e => { newProviderTemplate = e.target.value; CFW.renderAgent(); });
     const addProvider = CFW.$("#addProviderBtn", root);
@@ -215,6 +223,37 @@
         ${providerNames.map(name => `<option value="${esc(name)}" ${name === current ? "selected" : ""}>${esc(name)}</option>`).join("")}
       </select>
     </label>`;
+  }
+
+  function tencentAuthPanel(auth) {
+    const env = (auth.env || {}).keys || {};
+    const profiles = Array.isArray(auth.credential_profiles) ? auth.credential_profiles.join(",") : "akonly,default";
+    const sourceLabel = auth.source === "env" ? "AK/SK 环境变量" : (auth.source === "tccli" ? "tccli profile" : "未配置");
+    const tccli = Array.isArray(auth.tccli_profiles) ? auth.tccli_profiles : [];
+    return `<div class="tencent-auth-box">
+      <div class="flex between">
+        <div>
+          <b>${auth.ready ? "鉴权可用" : "鉴权未就绪"}</b>
+          <div class="mut small">当前来源: ${esc(sourceLabel)} · 密钥写入 ${esc((auth.env || {}).file || "服务器环境文件")}</div>
+        </div>
+        <span class="pill ${auth.ready ? "ok" : "warn"}">${auth.ready ? "READY" : "MISSING"}</span>
+      </div>
+      <div class="tencent-auth-grid">
+        ${plainInput("Region", "tencentRegion", auth.region || "ap-shanghai")}
+        ${plainInput("Endpoint", "tencentEndpoint", auth.endpoint || "cfw.tencentcloudapi.com")}
+        ${plainInput("CLI Profiles", "tencentProfiles", profiles)}
+        ${tencentSecret("SecretId", "TENCENTCLOUD_SECRET_ID", env)}
+        ${tencentSecret("SecretKey", "TENCENTCLOUD_SECRET_KEY", env)}
+        ${tencentSecret("Token(可选)", "TENCENTCLOUD_TOKEN", env)}
+      </div>
+      <div class="auth-profile-list">
+        ${tccli.map(item => `<span class="profile-chip ${item.ready ? "ready" : ""}">${esc(item.name)} · ${item.ready ? "可用" : (item.exists ? "文件存在但未识别" : "无文件")}</span>`).join("")}
+      </div>
+      <div class="flex between mt-sm">
+        <span class="hint">保存 AK/SK 后,告警拉取、源包取证、腾讯云封禁都会走这组凭证。</span>
+        <button class="btn primary" id="saveTencentAuthBtn">保存腾讯云鉴权</button>
+      </div>
+    </div>`;
   }
 
   function newProviderPane(providers, envStatus) {
@@ -289,6 +328,10 @@
     return `<label><span>${esc(label)}</span><input class="agent-input mono" data-provider-field="${esc(key)}" value="${esc(value)}"></label>`;
   }
 
+  function plainInput(label, id, value) {
+    return `<label><span>${esc(label)}</span><input id="${esc(id)}" class="agent-input mono" value="${esc(value)}"></label>`;
+  }
+
   function secretField(envName, envStatus, owner) {
     const env = String(envName || "").trim();
     const info = env ? (((envStatus || {}).keys || {})[env] || {}) : {};
@@ -297,6 +340,15 @@
     return `<label class="provider-secret">
       <span>API Key</span>
       <input class="agent-input mono" type="password" data-provider-secret="${esc(owner)}" data-provider-secret-env="${esc(env)}" placeholder="${esc(hint)}">
+    </label>`;
+  }
+
+  function tencentSecret(label, key, env) {
+    const info = (env || {})[key] || {};
+    const hint = `${key} · ${info.present ? "已配置" : "未配置"}`;
+    return `<label class="provider-secret">
+      <span>${esc(label)}</span>
+      <input class="agent-input mono" type="password" data-tencent-secret="${esc(key)}" placeholder="${esc(hint)}">
     </label>`;
   }
 
@@ -378,6 +430,35 @@
     CFW.$$("[data-route-stage]").forEach(el => { routing[el.dataset.routeStage] = el.value; });
     try {
       await postConfig({ routing });
+    } catch (e) {
+      configResult = { error: String(e) };
+      CFW.renderAgent();
+    }
+  }
+
+  async function saveTencentAuthConfig() {
+    const secrets = {};
+    CFW.$$("[data-tencent-secret]").forEach(el => {
+      const value = (el.value || "").trim();
+      if (value) secrets[el.dataset.tencentSecret] = value;
+    });
+    const payload = {
+      region: (CFW.$("#tencentRegion")?.value || "").trim(),
+      endpoint: (CFW.$("#tencentEndpoint")?.value || "").trim(),
+      credential_profiles: (CFW.$("#tencentProfiles")?.value || "").trim(),
+      secrets,
+    };
+    try {
+      const res = await fetch("/api/tencent/auth/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "tencent_auth_update_failed");
+      configResult = data;
+      if (CFW.loadData) await CFW.loadData(CFW.state.days);
+      CFW.renderAgent();
     } catch (e) {
       configResult = { error: String(e) };
       CFW.renderAgent();

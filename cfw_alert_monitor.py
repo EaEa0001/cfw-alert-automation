@@ -24,6 +24,8 @@ from tencentcloud.common.profile.client_profile import ClientProfile
 from tencentcloud.common.profile.http_profile import HttpProfile
 from tencentcloud.cfw.v20190904 import cfw_client, models
 
+from agent.llm.env import load_ai_env_into_process
+
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
@@ -64,6 +66,7 @@ def dt_text(value):
 def load_config():
     with CONFIG_PATH.open("r", encoding="utf-8") as fh:
         config = json.load(fh)
+    load_ai_env_into_process(config, ROOT)
     config["whitelist_ips"] = sorted(
         set(config.get("tencent_scan_ips", [])) | set(config.get("company_scan_ips", []))
     )
@@ -556,6 +559,7 @@ def _read_ini_credential(path, profile):
 
 
 def load_credentials(config):
+    load_ai_env_into_process(config, ROOT)
     env_sid = os.getenv("TENCENTCLOUD_SECRET_ID")
     env_sk = os.getenv("TENCENTCLOUD_SECRET_KEY")
     env_token = os.getenv("TENCENTCLOUD_TOKEN")

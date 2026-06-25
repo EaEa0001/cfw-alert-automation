@@ -8,15 +8,17 @@
 默认只绑定本机回环,数据不出本机。
 """
 import argparse
+import configparser
 import ipaddress
 import json
+import os
 import shlex
 from pathlib import Path
 
 from flask import Flask, jsonify, request
 
 import triage_stats as stats
-from agent.llm.env import load_ai_env_into_process, llm_env_status, save_ai_env_values
+from agent.llm.env import ai_env_path, load_ai_env_into_process, load_env_file, llm_env_status, save_ai_env_values
 from agent.llm.router import LLMRouter, _parse_jsonish
 from agent.rules import CustomRuleStore, llm_rule_parse_prompt, propose_rule_from_llm_parse, propose_rule_from_text
 from agent.schemas import AlertTask
@@ -24,6 +26,7 @@ from agent.triage_service import AgentTriageService
 
 app = Flask(__name__)
 ROOT = Path(__file__).resolve().parent
+TENCENT_ENV_KEYS = ("TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY", "TENCENTCLOUD_TOKEN")
 LEGACY_WHITELIST_CANDIDATES = [
     {
         "ip": "210.22.92.182",
@@ -138,8 +141,38 @@ def api_agent_config():
             "providers": _sanitize_llm_providers(config),
             "env": llm_env_status(config, ROOT),
         },
+        "tencent_auth": _tencent_auth_status(config),
         "agent": config.get("agent") or {},
     })
+
+
+@app.route("/api/tencent/auth/config", methods=["POST"])
+def api_tencent_auth_config_update():
+    body = request.get_json(silent=True) or {}
+    config = _load_local_config()
+
+    if "region" in body:
+        config["region"] = str(body.get("region") or "ap-shanghai").strip() or "ap-shanghai"
+    if "endpoint" in body:
+        config["endpoint"] = str(body.get("endpoint") or "cfw.tencentcloudapi.com").strip() or "cfw.tencentcloudapi.com"
+    if "credential_profiles" in body:
+        profiles = _parse_profiles(body.get("credential_profiles"))
+        if profiles:
+            config["credential_profiles"] = profiles
+
+    secrets_update = body.get("secrets") if isinstance(body.get("secrets"), dict) else {}
+    tencent_secrets = {
+        key: value for key, value in secrets_update.items()
+        if str(key) in TENCENT_ENV_KEYS
+    }
+    if tencent_secrets:
+        try:
+            save_ai_env_values(config, tencent_secrets, ROOT)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    _save_local_config(config)
+    return jsonify({"ok": True, "tencent_auth": _tencent_auth_status(config)})
 
 
 @app.route("/api/agent/providers/<provider_name>/test", methods=["POST"])
@@ -453,6 +486,105 @@ def _load_local_config():
 def _save_local_config(config):
     path = ROOT / "config.json"
     path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _tencent_auth_status(config):
+    load_ai_env_into_process(config, ROOT)
+    env_path = ai_env_path(config, ROOT)
+    env_values = load_env_file(env_path)
+    keys = {
+        key: {
+            "present": bool(os.environ.get(key) or env_values.get(key)),
+            "process": bool(os.environ.get(key)),
+            "file": bool(env_values.get(key)),
+        }
+        for key in TENCENT_ENV_KEYS
+    }
+    tccli_profiles = _tccli_profile_status(config)
+    env_ready = bool(keys["TENCENTCLOUD_SECRET_ID"]["present"] and keys["TENCENTCLOUD_SECRET_KEY"]["present"])
+    tccli_ready = any(item.get("ready") for item in tccli_profiles)
+    source = "env" if env_ready else ("tccli" if tccli_ready else "missing")
+    return {
+        "region": config.get("region", "ap-shanghai"),
+        "endpoint": config.get("endpoint", "cfw.tencentcloudapi.com"),
+        "credential_profiles": list(config.get("credential_profiles") or ["akonly", "default"]),
+        "source": source,
+        "ready": bool(env_ready or tccli_ready),
+        "env": {
+            "file": str(env_path),
+            "keys": keys,
+        },
+        "tccli_profiles": tccli_profiles,
+    }
+
+
+def _tccli_profile_status(config):
+    out = []
+    tccli_dir = Path.home() / ".tccli"
+    for profile in config.get("credential_profiles", ["akonly", "default"]):
+        name = str(profile or "").strip()
+        if not name:
+            continue
+        path = tccli_dir / f"{name}.credential"
+        out.append({
+            "name": name,
+            "file": str(path),
+            "exists": path.exists(),
+            "ready": _tccli_file_has_secret_pair(path, name),
+        })
+    return out
+
+
+def _tccli_file_has_secret_pair(path, profile):
+    if not path.exists():
+        return False
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if _json_has_secret_pair(value):
+            return True
+    except Exception:
+        pass
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(path, encoding="utf-8")
+    except Exception:
+        return False
+    sections = [profile] if profile in parser else parser.sections()
+    for section in sections:
+        values = parser[section]
+        sid = values.get("secretId") or values.get("secret_id") or values.get("SecretId")
+        sk = values.get("secretKey") or values.get("secret_key") or values.get("SecretKey")
+        if sid and sk:
+            return True
+    return False
+
+
+def _json_has_secret_pair(value):
+    if not isinstance(value, dict):
+        return False
+    sid = value.get("secretId") or value.get("SecretId") or value.get("secret_id") or value.get("SecretID")
+    sk = value.get("secretKey") or value.get("SecretKey") or value.get("secret_key")
+    if sid and sk:
+        return True
+    return any(_json_has_secret_pair(child) for child in value.values())
+
+
+def _parse_profiles(value):
+    if isinstance(value, str):
+        raw = value.replace(";", ",").replace("\n", ",").split(",")
+    elif isinstance(value, (list, tuple)):
+        raw = value
+    else:
+        raw = []
+    profiles = []
+    seen = set()
+    for item in raw:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        profiles.append(text)
+    return profiles
 
 
 def _parse_command_value(value):
