@@ -139,21 +139,21 @@
       box.innerHTML = `<div class="empty"><div class="big">暂无实时告警流</div><div>有新告警进入后会自动显示。</div></div>`;
       return;
     }
-    const make = () => {
-      const p = pool[Math.floor(Math.random() * pool.length)];
-      const now = new Date();
-      const ts = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`;
+    const timeText = value => {
+      const raw = String(value || "");
+      const m = raw.match(/\b(\d{2}:\d{2}:\d{2})\b/);
+      return m ? m[1] : "--:--:--";
+    };
+    const make = p => {
       const row = CFW.el("div", "tick-row");
-      row.innerHTML = `<span class="ts">${ts}</span>
+      row.innerHTML = `<span class="ts">${timeText(p.time)}</span>
         <span class="tag tag-${p.level}">${p.level}</span>
         <span>${esc(p.event)} <span class="mut mono" style="font-size:11px">${esc(p.src)}</span></span>
         <span class="res res-${p.res}" style="font-size:11.5px">${p.res}</span>`;
-      box.prepend(row);
-      while (box.children.length > 8) box.lastChild.remove();
+      box.appendChild(row);
     };
     box.innerHTML = "";
-    for (let i = 0; i < 6; i++) make();
-    tickerTimer = setInterval(make, 3500);
+    pool.slice(0, 8).forEach(make);
   }
 
   CFW.stopTicker = () => { if (tickerTimer) clearInterval(tickerTimer); };

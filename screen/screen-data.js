@@ -168,9 +168,13 @@
     };
   });
 
-  // ---- ticker 取样池: 从真实告警里取低开销样本 ----
-  const mapTicker = alerts => (alerts || []).slice(0, 12).map(a => ({
-    level: a.level, event: a.event, src: a.atkIp, res: a.result,
+  // ---- ticker 取样池: 只取实时关注流,不从历史告警里造实时事件 ----
+  const mapTicker = items => (items || []).slice(0, 12).map(a => ({
+    time: a.time || "",
+    level: a.level,
+    event: a.event,
+    src: a.src,
+    res: a.result,
   }));
 
   // 真实漏斗:全部由 overview.sources / total / retained 派生,无硬编码占位
@@ -241,7 +245,7 @@
     const pmapped = mapProfiles(pf);
     if (pmapped.length) CFW.DEMO.profiles = pmapped;
     else CFW.DEMO.profiles = [];  // 无画像数据则留空,不显示 demo 兜底
-    CFW.DEMO.tickerPool = mapTicker(CFW.DEMO.alerts);
+    CFW.DEMO.tickerPool = mapTicker(CFW.DEMO.attention);
     CFW.DEMO.funnel = buildFunnel(ov);  // 全真实派生
     CFW.DEMO.pipelineStatus = ps || {};
     CFW.DEMO.agent = ag || { model_routing: { routes: {}, providers: {} }, provider_health: {}, agent: {} };
