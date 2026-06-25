@@ -1,10 +1,10 @@
 """研判失败重试队列。
 
-模型连接抖动(WinError 10060 等)会导致部分告警降级为 rule_fallback,
-这些条目判不出真结果就一直挂"未处理",和网络正常的研判方(codex)口径不一致。
+模型连接抖动(WinError 10060 等)会导致部分告警无法生成模型结论。
+这些条目只标记为"待模型重试",不再生成本地替代结论。
 
-本模块把降级的告警记录落盘成队列,下次运行(网络恢复时)优先补判,
-判出真模型结果(非 rule_fallback)后才出队。不依赖数据库,纯 jsonl。
+本模块把待重试的告警记录落盘成队列,下次运行(网络恢复时)优先补判,
+判出真模型结果后才出队。不依赖数据库,纯 jsonl。
 
 队列项保存最小可重判信息(原始告警记录),因为告警中心记录是聚合事件,
 EventId 稳定,可据此去重和重判。
@@ -48,8 +48,8 @@ def save_queue(items):
             fh.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
-def enqueue(records, recorded_at, reason="model_degraded", max_size=2000):
-    """把降级的告警记录入队(已在队列的更新时间戳/计数)。"""
+def enqueue(records, recorded_at, reason="model_retry_pending", max_size=2000):
+    """把待重试的告警记录入队(已在队列的更新时间戳/计数)。"""
     if not records:
         return 0
     items = load_queue()

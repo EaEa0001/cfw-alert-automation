@@ -90,7 +90,7 @@
     const bar = (pct, color) => `<div class="meter"><span style="width:${pct}%;background:${color}"></span></div>`;
     return `
       <div class="hrow"><div style="flex:1"><div class="hl">源包命中率</div>${bar(h.evidenceHit, "var(--primary)")}</div><div class="hv net-pri">${h.evidenceHit}%</div></div>
-      <div class="hrow"><div style="flex:1"><div class="hl">模型降级率</div>${bar(h.degradedRate, "var(--warn)")}</div><div class="hv" style="color:var(--warn)">${h.degradedRate}%</div></div>
+      <div class="hrow"><div style="flex:1"><div class="hl">模型待重试率</div>${bar(h.retryPendingRate ?? h.degradedRate, "var(--warn)")}</div><div class="hv" style="color:var(--warn)">${h.retryPendingRate ?? h.degradedRate}%</div></div>
       <div class="hrow"><div class="hl">处置忽略累计</div><div class="hv">${fmt(h.disposeIgnored)}</div></div>
       <div class="hrow"><div class="hl">处置失败</div><div class="hv" style="color:${h.disposeFailed ? "var(--danger)" : "var(--ok)"}">${h.disposeFailed}</div></div>
       <div class="hrow"><div class="hl">LLM 错误 / 重试队列</div><div class="hv">${h.llmErrors} / ${h.retryQueue}</div></div>

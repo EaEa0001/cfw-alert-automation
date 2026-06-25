@@ -64,8 +64,7 @@
       "source_review": "codex_direct",
       "agent_triage": "codex_direct",
       "critical_review": "codex_direct",
-      "rule_parse": "codex_direct",
-      "fallback": "codex_direct"
+      "rule_parse": "codex_direct"
     },
     "providers": {
       "codex_direct": {

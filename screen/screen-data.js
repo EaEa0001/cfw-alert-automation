@@ -56,14 +56,16 @@
     const ebt = h.errors_by_type || {};
     return {
       evidenceHit: h.evidence_hit_rate || h.evidenceHit || 0,
-      degradedRate: h.degraded_rate || h.degradedRate || 0,
+      retryPendingRate: h.retry_pending_rate || h.retryPendingRate || h.degraded_rate || h.degradedRate || 0,
+      degradedRate: h.retry_pending_rate || h.retryPendingRate || h.degraded_rate || h.degradedRate || 0,
       disposeIgnored: h.dispose_ignored || h.disposeIgnored || 0,
       disposeFailed: h.dispose_failed || h.disposeFailed || 0,
       llmErrors: h.errors_total || 0,
       agentCount: h.agent_count || h.agentCount || 0,
       retryQueue: h.retry_queue || h.retryQueue || 0,
       evidenceHitCount: h.evidence_hit || h.evidenceHitCount || 0,
-      degraded: h.degraded || 0,
+      retryPending: h.retry_pending || h.retryPending || h.degraded || 0,
+      degraded: h.retry_pending || h.retryPending || h.degraded || 0,
       total: h.total || 0,
       errorsByType: ebt,
     };
@@ -190,8 +192,8 @@
         note: "主动拉取源数据包,基于真实 HTTP 包给结论" },
       { key: "l3", label: "第 3 层 · Agent 工具循环", n: s["Agent"] || 0, tone: "danger",
         note: "高危/复杂,模型自主取证(只读)多轮研判" },
-      { key: "degraded", label: "降级兜底(连接/解析异常)", n: s["降级兜底"] || 0, tone: "warn",
-        note: "Codex 不可用时按规则降级,入重试队列待补判" },
+      { key: "retry", label: "待模型重试", n: s["待模型重试"] || s["降级兜底"] || 0, tone: "warn",
+        note: "模型/API 不可用时不生成本地结论,入重试队列自动补判" },
       { key: "keep", label: "保留人工复核", n: retained, tone: "danger",
         note: "需人工复核 + 确认成功" },
     ];

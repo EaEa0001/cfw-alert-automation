@@ -70,6 +70,29 @@ def _record_id(record):
     return str(record.get("EventId") or record.get("AlertClusterId") or "")
 
 
+def _is_retry_pending_item(item):
+    return (
+        monitor.is_retry_pending_judgement(item or {})
+        or monitor.is_retry_pending_source((item or {}).get("研判来源", ""))
+    )
+
+
+def _split_retry_queue_records(records, judgement_items):
+    rec_by_id = {_record_id(record): record for record in records}
+    pending_records = []
+    resolved_ids = []
+    for event_id, item in judgement_items:
+        event_id = str(event_id or "")
+        if not event_id:
+            continue
+        if _is_retry_pending_item(item):
+            if event_id in rec_by_id:
+                pending_records.append(rec_by_id[event_id])
+        else:
+            resolved_ids.append(event_id)
+    return pending_records, resolved_ids
+
+
 def _realtime_config(config):
     cfg = dict(config.get("realtime_triage") or {})
     cfg.setdefault("enabled", True)
@@ -1006,7 +1029,7 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
         max_deep = int(alert_cfg.get("deep_triage_max", 120))
         deep_records = deep_records[:max_deep]
 
-        # 先消费重试队列:之前因模型连接超时降级的告警,网络好时在这里补判。
+        # 先消费重试队列:之前因模型连接超时待重试的告警,网络好时在这里补判。
         # 队列里的告警可能在当前时间窗外,需显式并入深判集合(去重)。
         try:
             import retry_queue
@@ -1048,20 +1071,12 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
                 deep_ignore_ids.append(event_id)
             ignore_ids = ignore_ids + deep_ignore_ids
 
-            # 重试队列维护:降级(连接超时)的入队等下次补判;判出真模型结果的出队。
+            # 重试队列维护:待重试的入队等下次补判;判出真模型结果的出队。
             try:
                 import retry_queue
-                rec_by_id = {str(r.get("EventId") or r.get("AlertClusterId") or ""): r for r in deep_records}
-                degraded, resolved = [], []
-                for eid, item in deep_judgements.items():
-                    src = str(item.get("研判来源", ""))
-                    if src.startswith("rule_fallback"):
-                        if eid in rec_by_id:
-                            degraded.append(rec_by_id[eid])
-                    else:
-                        resolved.append(eid)  # 判出真模型结果,出队
+                pending_retry, resolved = _split_retry_queue_records(deep_records, deep_judgements.items())
                 if not dry_run:
-                    queue_enqueued = retry_queue.enqueue(degraded, monitor.dt_text(monitor.now_local()))
+                    queue_enqueued = retry_queue.enqueue(pending_retry, monitor.dt_text(monitor.now_local()))
                     # 出队:判出真结果的 + 被规则/模型忽略掉的(已处置)
                     queue_resolved = retry_queue.dequeue(set(resolved) | set(deep_ignore_ids))
             except Exception:
@@ -1116,8 +1131,8 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
         "deep_triaged": len(deep_judgements),
         "deep_ignored": len(set(deep_ignore_ids)),
         "deep_results": dict(Counter(item.get("模型研判", "") for item in deep_judgements.values())),
-        "deep_degraded": sum(1 for item in deep_judgements.values()
-                             if str(item.get("研判来源", "")).startswith("rule_fallback")),
+        "deep_retry_pending": sum(1 for item in deep_judgements.values() if _is_retry_pending_item(item)),
+        "deep_degraded": sum(1 for item in deep_judgements.values() if _is_retry_pending_item(item)),
         "retry_queue_consumed": queue_consumed,
         "retry_queue_resolved": queue_resolved,
         "retry_queue_enqueued": queue_enqueued,
@@ -1255,6 +1270,8 @@ def manual_review_candidates(judged_rows, ignore_ids):
             continue
         if row.get("研判来源") == "rule_whitelist":
             continue
+        if _is_retry_pending_item(row):
+            continue
         if not row.get("模型研判"):
             continue
         candidates.append(row)
@@ -1361,25 +1378,30 @@ def write_jsonl(path, rows):
 
 
 def recover_degraded_queue(config, dry_run=False, max_records=200):
-    """AI 重新接入成功后,自动对降级兜底的告警复判。
+    """AI 重新接入成功后,自动对待重试告警复判。
 
     轻量、可频繁调度:
       1. 队列为空 -> 直接返回(零成本 no-op)
       2. 队列非空但 Codex 不可达 -> 返回 waiting,下次再来
-      3. 队列非空且 Codex 可达 -> 只对队列里的降级告警重跑深度研判,
-         判出真模型结果/可忽略的出队并处置,仍降级的留队列等下次。
+      3. 队列非空且 Codex 可达 -> 只对队列里的待重试告警重跑深度研判,
+         判出真模型结果/可忽略的出队并处置,仍待重试的留队列等下次。
     """
     import retry_queue
     queued = retry_queue.queued_records(max_records=max_records)
-    result = {"mode": "recover_degraded", "dry_run": dry_run,
+    result = {"mode": "recover_retry_pending", "dry_run": dry_run,
               "queue_size": len(retry_queue.load_queue()), "rejudged": 0,
-              "resolved": 0, "still_degraded": 0, "ignored": 0,
+              "resolved": 0, "still_pending": 0, "still_degraded": 0, "ignored": 0,
               "omit_actions": [], "status": "idle"}
     if not queued:
         result["status"] = "empty"
         return result
-    # 队列非空,先确认 AI 真的回来了(精确预检)
-    if not monitor.codex_reachable(config):
+    # 队列非空,直连 Codex 模式先做精确预检;其他 Provider 交给当前路由尝试。
+    llm = config.get("llm") or {}
+    uses_codex_direct = (
+        not monitor.router_enabled(config)
+        and llm.get("provider", "codex_cli") == "codex_direct"
+    )
+    if uses_codex_direct and not monitor.codex_reachable(config):
         result["status"] = "waiting_codex_unreachable"
         return result
 
@@ -1395,9 +1417,8 @@ def recover_degraded_queue(config, dry_run=False, max_records=200):
     for eid, item in judgements.items():
         if not eid:
             continue
-        src = str(item.get("研判来源", ""))
-        if src.startswith("rule_fallback"):
-            still.append(eid)          # 还是降级,留队列
+        if _is_retry_pending_item(item):
+            still.append(eid)          # 还是待重试,留队列
             continue
         resolved.append(eid)           # 判出真模型结果,出队
         res = item.get("模型研判")
@@ -1407,6 +1428,7 @@ def recover_degraded_queue(config, dry_run=False, max_records=200):
                 continue               # 高危存疑不忽略
             ignore_ids.append(eid)
     result["resolved"] = len(resolved)
+    result["still_pending"] = len(still)
     result["still_degraded"] = len(still)
     result["ignored"] = len(ignore_ids)
 
@@ -1445,6 +1467,19 @@ def realtime_triage_once(config, dry_run=False):
         new_records.append(record)
     max_records = int(cfg.get("max_records_per_round", 80))
     new_records = new_records[:max_records]
+    retry_queue_consumed = 0
+    try:
+        import retry_queue
+        seen_ids = {_record_id(record) for record in new_records if _record_id(record)}
+        retry_max = int(cfg.get("retry_max_per_round", max_records))
+        for qrec in retry_queue.queued_records(max_records=retry_max):
+            qid = _record_id(qrec)
+            if qid and qid not in seen_ids:
+                new_records.append(qrec)
+                seen_ids.add(qid)
+                retry_queue_consumed += 1
+    except Exception:
+        retry_queue = None
 
     result = {
         "mode": "realtime_triage_once",
@@ -1454,6 +1489,7 @@ def realtime_triage_once(config, dry_run=False):
         "query_total": query["total"],
         "active_before": len(records),
         "new_records": len(new_records),
+        "retry_queue_consumed": retry_queue_consumed,
         "dedup_removed": dedup_stats.get("dup_removed", 0),
         "state_file": str(_realtime_state_path(config)),
     }
@@ -1478,6 +1514,22 @@ def realtime_triage_once(config, dry_run=False):
     attach_policy_fields(judgements, rows)
     judged_rows = apply_judgements(rows, judgements)
     ignore_ids = [row["告警ID"] for row in judged_rows if can_ignore_judged_row(row, new_records, judgements)]
+    retry_queue_enqueued = 0
+    retry_queue_resolved = 0
+    if not dry_run:
+        try:
+            pending_retry, resolved = _split_retry_queue_records(
+                new_records,
+                ((row.get("告警ID"), row) for row in judged_rows),
+            )
+            retry_queue_enqueued = retry_queue.enqueue(
+                pending_retry,
+                now_text,
+                reason="model_retry_pending",
+            )
+            retry_queue_resolved = retry_queue.dequeue(set(resolved) | set(ignore_ids))
+        except Exception:
+            pass
 
     white_actions = []
     omit_actions = []
@@ -1538,6 +1590,8 @@ def realtime_triage_once(config, dry_run=False):
         "manual_candidates": len(manual_rows),
         "manual_pending_push": len(pending_manual_rows),
         "manual_push": manual_push,
+        "retry_queue_enqueued": retry_queue_enqueued,
+        "retry_queue_resolved": retry_queue_resolved,
         "white_actions": white_actions,
         "omit_actions": omit_actions,
         "judgement_jsonl": str(jsonl_path),
@@ -1596,7 +1650,7 @@ def main():
     parser.add_argument("--max-rounds", type=int, default=0, help="轮询测试用:跑 N 轮后退出,0 表示常驻")
     parser.add_argument("--reset-realtime-state", action="store_true")
     parser.add_argument("--recover", action="store_true",
-                        help="AI 重新接入后,对降级兜底队列复判(轻量,可频繁调度)")
+                        help="AI 重新接入后,对待模型重试队列复判(轻量,可频繁调度)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--limit", type=int)
     args = parser.parse_args()
@@ -1645,7 +1699,7 @@ def main():
     if args.limit:
         records = records[: args.limit]
 
-    # 并入重试队列里之前降级未判出的告警(日报无紧超时,适合补判积压),去重。
+    # 并入重试队列里之前待模型重试的告警(日报无紧超时,适合补判积压),去重。
     try:
         import retry_queue
         seen_ids = {str(r.get("EventId") or r.get("AlertClusterId") or "") for r in records}
@@ -1716,22 +1770,15 @@ def main():
     ignore_ids = [row["告警ID"] for row in judged_rows if can_ignore_judged_row(row, records, judgements)]
     candidates = white_rule_candidates(rows)
 
-    # 重试队列维护:降级(连接异常/解析失败)的入队,等下次网络好时 Agent 补判;
-    # 判出真模型结果或已忽略的出队。解决"降级→直接挂需人工→再不被补判"导致的人工率虚高。
+    # 重试队列维护:待重试(连接异常/解析失败)的入队,等下次网络好时 Agent 补判;
+    # 判出真模型结果或已忽略的出队。
     if not args.dry_run:
         try:
-            rec_by_id = {str(r.get("EventId") or r.get("AlertClusterId") or ""): r for r in records}
-            degraded, resolved = [], []
-            for row in judged_rows:
-                aid = row.get("告警ID")
-                if not aid:
-                    continue
-                if str(row.get("研判来源", "")).startswith("rule_fallback"):
-                    if aid in rec_by_id:
-                        degraded.append(rec_by_id[aid])
-                else:
-                    resolved.append(aid)  # 判出真结果,出队
-            retry_queue.enqueue(degraded, monitor.dt_text(monitor.now_local()))
+            pending_retry, resolved = _split_retry_queue_records(
+                records,
+                ((row.get("告警ID"), row) for row in judged_rows),
+            )
+            retry_queue.enqueue(pending_retry, monitor.dt_text(monitor.now_local()), reason="model_retry_pending")
             retry_queue.dequeue(set(resolved) | set(ignore_ids))
         except Exception:
             pass

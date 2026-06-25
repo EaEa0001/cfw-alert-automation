@@ -11,7 +11,7 @@
   M1 内网业务误报率   内网→内网且响应为正常业务JSON,却被判攻击/横向的比例(越低越好)
   M2 成功证据严谨度   判"确认成功"的里,确实有落地证据(cmd/webshell/敏感数据/木马/云端成功)的比例
   M3 源包命中率       研判时有真实源包(主动拉取/本地缓存)的比例
-  M4 降级率           rule_fallback / 重试失败导致未真正研判的比例(越低越好)
+  M4 待重试率         模型/API 异常导致未真正研判的比例(越低越好)
   M5 高危召回         含明确落地信号(njRAT/webshell/cmd_uid/云端成功)的告警未被自动忽略的比例
 """
 import argparse
@@ -77,8 +77,8 @@ def evaluate(days=2):
     m2_grounded = []  # 其中有落地证据的
     # --- M3 源包命中 ---
     m3_with_evidence = 0
-    # --- M4 降级 ---
-    m4_degraded = 0
+    # --- M4 待重试 ---
+    m4_retry_pending = 0
     # --- M5 高危召回 ---
     m5_landed_alerts = []   # 有明确落地信号的告警
     m5_retained = []        # 其中未被自动忽略的
@@ -98,9 +98,9 @@ def evaluate(days=2):
         if r.get("证据来源") in ("主动拉取", "本地缓存"):
             m3_with_evidence += 1
 
-        # M4 降级
-        if str(src_label).startswith("rule_fallback") or src_label == "降级兜底":
-            m4_degraded += 1
+        # M4 待重试
+        if str(src_label).startswith(("retry_pending", "rule_fallback")) or src_label in ("待模型重试", "降级兜底"):
+            m4_retry_pending += 1
 
         # M1 内网业务误报:源和目标都内网 + 响应像正常业务 + 无落地信号
         if _internal(ip) and _internal(dst) and _business_ok(evidence_blob) and not _has_landed(evidence_blob):
@@ -147,9 +147,9 @@ def evaluate(days=2):
             "value": rate(m3_with_evidence, n), "好坏": "越高越好",
             "有源包": m3_with_evidence, "总数": n,
         },
-        "M4_降级率": {
-            "value": rate(m4_degraded, n), "好坏": "越低越好",
-            "降级数": m4_degraded, "总数": n,
+        "M4_待重试率": {
+            "value": rate(m4_retry_pending, n), "好坏": "越低越好",
+            "待重试数": m4_retry_pending, "总数": n,
         },
         "M5_高危召回": {
             "value": rate(len(m5_retained), len(m5_landed_alerts)),

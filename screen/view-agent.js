@@ -1,14 +1,13 @@
 /* ===== 视图：Agent 配置 (模型路由 + Provider/API + dry-run 预览) ===== */
 (function () {
   const { esc } = CFW;
-  const STAGES = ["batch_triage", "source_review", "agent_triage", "critical_review", "rule_parse", "fallback"];
+  const STAGES = ["batch_triage", "source_review", "agent_triage", "critical_review", "rule_parse"];
   const STAGE_LABELS = {
     batch_triage: "批量研判",
     source_review: "源包复核",
     agent_triage: "Agent 工具循环",
     critical_review: "高危复核",
     rule_parse: "自然语言规则解析",
-    fallback: "兜底路由",
   };
   const PROVIDER_TEMPLATES = {
     deepseek_fast: {

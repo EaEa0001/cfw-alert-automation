@@ -11,8 +11,8 @@
         <h2 class="flex between"><span>告警人工研判台</span><span class="hint">点击任意行展开完整告警、证据和处置上下文</span></h2>
         <div class="filters triage-filters">
           ${sel("level", "全部等级", ["高危", "中危", "低危"])}
-          ${sel("result", "全部研判", ["确认成功", "需人工复核", "未见成功证据", "确认未成功", "扫描探测", "业务误报"])}
-          ${sel("source", "全部来源", ["单轮", "源包复核", "Agent", "白名单规则", "降级兜底", "custom_rule"])}
+          ${sel("result", "全部研判", ["确认成功", "需人工复核", "待模型重试", "未见成功证据", "确认未成功", "扫描探测", "业务误报"])}
+          ${sel("source", "全部来源", ["单轮", "源包复核", "Agent", "白名单规则", "待模型重试", "custom_rule"])}
           <input id="triageSearch" class="triage-search" placeholder="搜索事件 / IP / 规则 / 资产 / 告警ID" value="${esc(state.q)}">
           <label class="triage-check"><input type="checkbox" id="manualOnly" ${state.manualOnly ? "checked" : ""}> 只看需人工</label>
           <span class="filt-count mut" id="filtCount"></span>

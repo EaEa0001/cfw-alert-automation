@@ -252,7 +252,7 @@
   function sourceTone(name) {
     if (name === "Agent") return "violet";
     if (name === "源包复核") return "primary";
-    if (name === "降级兜底") return "danger";
+    if (name === "待模型重试") return "warn";
     return "ok";
   }
 

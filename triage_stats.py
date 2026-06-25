@@ -15,7 +15,7 @@ DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "reports"
 LOG_DIR = ROOT / "logs"
 
-RESULT_ORDER = ["确认成功", "需人工复核", "未见成功证据", "确认未成功", "扫描探测"]
+RESULT_ORDER = ["确认成功", "需人工复核", "待模型重试", "未见成功证据", "确认未成功", "扫描探测"]
 PROFILE_NO_SUCCESS_RESULTS = {"确认未成功", "未见成功证据", "扫描探测", "业务误报"}
 PROFILE_STAGE_ALIASES = {
     "": "",
@@ -63,9 +63,14 @@ def source_label(value):
     value = str(value or "")
     if value in SOURCE_LABEL:
         return SOURCE_LABEL[value]
-    if value.startswith("rule_fallback"):
-        return "降级兜底"
+    if is_retry_pending_source(value):
+        return "待模型重试"
     return value or "未知"
+
+
+def is_retry_pending_source(value):
+    value = str(value or "")
+    return value.startswith("retry_pending") or value.startswith("rule_fallback")
 
 
 def profile_stage_label(value, default="探测"):
@@ -567,9 +572,9 @@ def attack_graph(days=7, focus="key", max_edges=200, min_danger=0, collapse_solo
 
 
 def health(days=7):
-    """健康面板:LLM 错误/降级、处置失败、源包命中率、Agent 占比、企微发送。"""
+    """健康面板:LLM 错误/待重试、处置失败、源包命中率、Agent 占比、企微发送。"""
     cutoff = datetime.now() - timedelta(days=days)
-    # LLM 错误(降级原因)
+    # LLM 错误(待重试原因)
     errors = []
     err_by_type = Counter()
     for e in _read_jsonl(LOG_DIR / "llm-errors.jsonl"):
@@ -593,7 +598,7 @@ def health(days=7):
     rows = load_judgements(days)
     with_evidence = sum(1 for r in rows if r.get("证据来源") in ("主动拉取", "本地缓存"))
     agent_count = sum(1 for r in rows if r.get("研判来源") == "codex_agent")
-    degraded = sum(1 for r in rows if str(r.get("研判来源", "")).startswith("rule_fallback"))
+    retry_pending = sum(1 for r in rows if is_retry_pending_source(r.get("研判来源", "")))
     return {
         "errors_total": sum(err_by_type.values()),
         "errors_by_type": dict(err_by_type),
@@ -602,8 +607,10 @@ def health(days=7):
         "dispose_failed": dispose_failed,
         "evidence_hit_rate": round(with_evidence / len(rows) * 100, 1) if rows else 0,
         "evidence_hit": with_evidence,
-        "degraded": degraded,
-        "degraded_rate": round(degraded / len(rows) * 100, 1) if rows else 0,
+        "retry_pending": retry_pending,
+        "retry_pending_rate": round(retry_pending / len(rows) * 100, 1) if rows else 0,
+        "degraded": retry_pending,
+        "degraded_rate": round(retry_pending / len(rows) * 100, 1) if rows else 0,
         "agent_count": agent_count,
         "total": len(rows),
     }
@@ -996,8 +1003,8 @@ def _fallback_profiles_from_judgements(days=7, limit=50):
             "last_seen": g["last_seen"],
             "events": dict(g["events"]),
             "targets": sorted(g["targets"]),
-            "run_at": "rule_fallback",
-            "profile_source": "rule_fallback",
+            "run_at": "profile_generated",
+            "profile_source": "profile_generated",
         })
     out.sort(key=lambda p: (p["score"], p["alert_count"], p["technique_kinds"]), reverse=True)
     return out[:limit]
@@ -1029,7 +1036,7 @@ def _print_console(days):
         print(f"   {s:10s} 调用{v['count']:4d}  in {v['in']:>9,}  out {v['out']:>7,}  reason {v['reason']:>7,}")
     print(line)
     print(f"源包命中率 {he['evidence_hit_rate']}% ({he['evidence_hit']}/{he['total']})  |  Agent 研判 {he['agent_count']}")
-    print(f"处置忽略 {he['dispose_ignored']}  |  处置失败 {he['dispose_failed']}  |  LLM错误/降级 {he['errors_total']} {he['errors_by_type']}")
+    print(f"处置忽略 {he['dispose_ignored']}  |  处置失败 {he['dispose_failed']}  |  LLM错误/待重试 {he['errors_total']} {he['errors_by_type']}")
     if he["recent_errors"]:
         print("最近错误:")
         for e in he["recent_errors"][:5]:

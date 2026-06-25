@@ -272,7 +272,7 @@ def api_agent_llm_config_update():
 
     routing_update = body.get("routing") if isinstance(body.get("routing"), dict) else None
     if routing_update:
-        allowed_stages = {"batch_triage", "source_review", "agent_triage", "critical_review", "rule_parse", "fallback"}
+        allowed_stages = {"batch_triage", "source_review", "agent_triage", "critical_review", "rule_parse"}
         providers = llm.get("providers") or {}
         for stage, provider in routing_update.items():
             stage = str(stage)

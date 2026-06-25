@@ -68,7 +68,7 @@ CFW.DEMO = {
 
   // —— 系统健康 —— ← /api/health
   health: {
-    evidenceHit: 64, degradedRate: 7, disposeIgnored: 3817, disposeFailed: 0,
+    evidenceHit: 64, retryPendingRate: 7, degradedRate: 7, disposeIgnored: 3817, disposeFailed: 0,
     llmErrors: 3, agentCount: 14, retryQueue: 2,
     errorsByType: { "WinError 10060": 2, "WinError 10061": 1 }
   },

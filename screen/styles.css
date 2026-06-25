@@ -674,9 +674,10 @@ th.r {
   color: var(--violet);
 }
 
+.src-待模型重试,
 .src-降级兜底 {
-  background: var(--danger-dim);
-  color: var(--danger);
+  background: var(--warn-dim);
+  color: var(--warn);
 }
 
 .src-白名单规则,

@@ -88,7 +88,6 @@
 - `source_review`：源包复核，适合强推理模型。
 - `agent_triage`：高危/疑难告警工具循环，适合 Codex/Claude。
 - `rule_parse`：自然语言规则解析。
-- `fallback`：备用模型。
 
 支持 provider 类型：
 

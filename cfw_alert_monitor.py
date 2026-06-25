@@ -250,7 +250,8 @@ def build_hourly_wecom_message(start_text, end_text, total, rows, judged_rows, d
     # 原始流量需关注(确认成功/需人工/高危)
     flow_review = [
         row for row in judged_rows
-        if row.get("模型研判") in ("确认成功", "需人工复核") or row.get("告警等级") in ("严重", "高危")
+        if not is_retry_pending_source(row.get("研判来源", ""))
+        and (row.get("模型研判") in ("确认成功", "需人工复核") or row.get("告警等级") in ("严重", "高危"))
     ]
 
     # 告警中心保留项:分流为「真威胁(需关注)」和「背景噪声(只计数)」
@@ -265,7 +266,7 @@ def build_hourly_wecom_message(start_text, end_text, total, rows, judged_rows, d
         it["_plain"], it["_prio"] = _plain_reason(it.get("reason"))
     threats.sort(key=lambda it: (it["_prio"], not it.get("src_public", False)))
 
-    fallback_count = sum(1 for row in judged_rows if str(row.get("研判来源", "")).startswith("rule_fallback"))
+    retry_pending_count = sum(1 for row in judged_rows if is_retry_pending_source(row.get("研判来源", "")))
     has_critical = ac.get("retained_success", 0) or any(it["_prio"] <= 2 for it in threats) or flow_review
 
     lines = [f"## 🛡️ 云防火墙告警简报  {window}"]
@@ -280,13 +281,13 @@ def build_hourly_wecom_message(start_text, end_text, total, rows, judged_rows, d
         + (f"(已合并 {_dedup} 条容器转发重复)" if _dedup else "")
         + (f"(另原始流量 {len(rows)} 条)" if rows else "")
     )
-    # 模型连接异常时本轮深判被短路降级,这些不是"没研判",是已入队待网络恢复自动补判。
-    _degraded = ac.get("deep_degraded", 0)
+    # 模型连接异常时本轮深判被短路为待重试,已入队待网络恢复自动补判。
+    _pending = ac.get("deep_retry_pending", ac.get("deep_degraded", 0))
     _enqueued = ac.get("retry_queue_enqueued", 0)
-    if _degraded or _enqueued:
+    if _pending or _enqueued:
         lines.append(
-            f"> ⚠️ <font color=\"warning\">本轮模型连接异常,**{max(_degraded, _enqueued)}** 条暂未深判"
-            f"(下方研判为规则初判),已入队,网络恢复后自动用 Agent 补判</font>"
+            f"> ⚠️ <font color=\"warning\">本轮模型连接异常,**{max(_pending, _enqueued)}** 条未生成研判结论"
+            f",已入队,恢复后自动补判</font>"
         )
 
     # 按攻击者(源IP集合)聚合,同一组源IP的多手法合并成一条,避免刷屏
@@ -339,8 +340,8 @@ def build_hourly_wecom_message(start_text, end_text, total, rows, judged_rows, d
         {"actions": (ac.get("omit_actions") or []) + (ac.get("white_actions") or [])})
     if fails:
         lines.append(f"\n<font color=\"warning\">⚠️ 处置失败 **{fails}** 条,需检查</font>")
-    if fallback_count:
-        lines.append(f"<font color=\"warning\">⚠️ 模型降级 **{fallback_count}** 条(连接异常,用规则兜底)</font>")
+    if retry_pending_count:
+        lines.append(f"<font color=\"warning\">⚠️ 待模型重试 **{retry_pending_count}** 条(未生成研判结论)</font>")
     if not (threats or flow_review):
         lines.append("\n<font color=\"info\">✅ 本小时无需重点关注的告警</font>")
 
@@ -418,8 +419,8 @@ def build_daily_wecom_message(day, events, ip_rows, alert_rows=None):
     final_rows = alert_rows if alert_rows is not None else latest_unique_hourly_judgements(day)
     judgement_counts = Counter(row.get("模型研判", "") for row in final_rows if row.get("模型研判"))
     source_counts = Counter(row.get("研判来源", "") for row in final_rows if row.get("研判来源"))
-    fallback_count = sum(
-        count for source, count in source_counts.items() if source.startswith("rule_fallback")
+    retry_pending_count = sum(
+        count for source, count in source_counts.items() if is_retry_pending_source(source)
     )
     attention_rows = [
         row
@@ -474,7 +475,7 @@ def build_daily_wecom_message(day, events, ip_rows, alert_rows=None):
     total = len(events)
     confirmed = judgement_counts.get("确认成功", 0)
     manual = judgement_counts.get("需人工复核", 0)
-    auto_done = total - confirmed - manual  # 自动处理掉的(各类无害结论)
+    auto_done = max(0, total - confirmed - manual - retry_pending_count)  # 自动处理掉的(各类无害结论)
     total_failures = action_failures + alert_center_failures
 
     # 一句话结论
@@ -482,8 +483,8 @@ def build_daily_wecom_message(day, events, ip_rows, alert_rows=None):
         verdict = f"⚠️ **发现 {confirmed} 条确认成功,需立即处置**"
     elif total_failures:
         verdict = f"⚠️ 处置有 **{total_failures}** 条失败,需检查"
-    elif fallback_count >= total * 0.5 and total:
-        verdict = f"⚠️ 模型连接异常,**{fallback_count}** 条降级未深判(已入队,网络恢复自动补判)"
+    elif retry_pending_count:
+        verdict = f"⚠️ 模型连接异常,**{retry_pending_count}** 条待模型重试(已入队,恢复后自动补判)"
     elif manual:
         verdict = f"✅ 无确认得手;**{manual}** 条待人工复核,其余已自动处理"
     else:
@@ -495,12 +496,12 @@ def build_daily_wecom_message(day, events, ip_rows, alert_rows=None):
         f"## 云防火墙日报 {day}",
         f"> {verdict}",
         f"- 全天告警 **{total}** 条(高危 {levels.get('高危', 0)})| 攻击IP **{len(ip_rows)}** 个",
-        f"- 处理:自动 **{auto_done + ignored_alerts + alert_center_ignored}** | 待人工 **{manual}** | 确认成功 **{confirmed}**",
+        f"- 处理:自动 **{auto_done + ignored_alerts + alert_center_ignored}** | 待人工 **{manual}** | 待重试 **{retry_pending_count}** | 确认成功 **{confirmed}**",
         f"- 主要攻击源:{top_ip}",
         f"- 主要手法:{top_ev}",
     ]
-    if fallback_count:
-        lines.append(f"- <font color=\"warning\">模型降级 {fallback_count} 条(已入队待补判)</font>")
+    if retry_pending_count:
+        lines.append(f"- <font color=\"warning\">待模型重试 {retry_pending_count} 条(已入队待补判)</font>")
     lines.append("> 扫描IP/漏扫IP已排除不封禁;明细见控制台")
     return "\n".join(lines)
 
@@ -1419,45 +1420,47 @@ def judgement_key(row):
     return row.get("告警ID") or row.get("攻击IP", "")
 
 
-def fallback_judgement(row, source, model):
-    key = judgement_key(row)
-    if row.get("告警ID"):
-        level = row.get("告警等级", "")
-        event_name = row.get("事件名称", "")
-        return {
-            "告警ID": key,
-            "攻击IP": row.get("攻击IP", ""),
-            "模型研判": alert_classify_for(level, event_name),
-            "模型置信度": "低" if source.startswith("rule_fallback") else "中",
-            "研判理由": "模型不可用，已按告警等级和事件类型使用本地规则降级",
-            "下一步": row.get("本地建议", ""),
-            "研判来源": source,
-            "研判模型": model,
-        }
+RETRY_PENDING_RESULT = "待模型重试"
+RETRY_PENDING_SOURCE_PREFIX = "retry_pending"
+LEGACY_RETRY_SOURCE_PREFIX = "rule_fallback"
 
-    levels = []
-    for name in ("严重", "高危", "中危", "低危", "提示"):
-        try:
-            if int(row.get(name) or 0) > 0:
-                levels.append(name)
-        except ValueError:
-            pass
-    event_names = [part.strip() for part in str(row.get("主要事件") or "").split(";") if part.strip()]
-    return {
+
+def is_retry_pending_source(source):
+    source = str(source or "")
+    return source.startswith(RETRY_PENDING_SOURCE_PREFIX) or source.startswith(LEGACY_RETRY_SOURCE_PREFIX)
+
+
+def is_retry_pending_judgement(item):
+    return (
+        str((item or {}).get("模型研判", "")) == RETRY_PENDING_RESULT
+        or str((item or {}).get("研判来源", "")).startswith(RETRY_PENDING_SOURCE_PREFIX)
+    )
+
+
+def retry_pending_judgement(row, source, model, reason=None):
+    key = judgement_key(row)
+    reason = reason or "模型/API 暂不可用，未生成研判结论，已加入重试队列，恢复后自动补判"
+    item = {
         "攻击IP": row.get("攻击IP", ""),
-        "模型研判": classify_for(levels, event_names),
-        "模型置信度": "低" if source.startswith("rule_fallback") else "中",
-        "研判理由": "模型不可用，已按等级、事件类型和频次使用本地规则降级",
-        "下一步": row.get("建议处置", ""),
+        "模型研判": RETRY_PENDING_RESULT,
+        "模型置信度": "",
+        "研判理由": reason,
+        "下一步": "等待模型/API 恢复后自动重试",
         "研判来源": source,
         "研判模型": model,
+        "输入Token": "0",
+        "输出Token": "0",
+        "推理Token": "0",
     }
+    if row.get("告警ID"):
+        item["告警ID"] = key
+    return item
 
 
 def salvage_json_objects(text):
     """从被截断的 JSON 数组里抢救出所有完整的 {...} 对象。
 
-    大批次研判时模型输出可能超长被截断,导致整段 json.loads 失败、整批降级。
+    大批次研判时模型输出可能超长被截断,导致整段 json.loads 失败、整批待重试。
     这里逐字符扫描配平花括号,把已经完整的对象一个个抠出来,避免整批丢失。
     """
     objs = []
@@ -1509,7 +1512,7 @@ def parse_llm_json(text):
                 return json.loads(match.group(0))
             except json.JSONDecodeError:
                 pass
-        # 截断抢救:抠出所有完整对象,至少保住一部分研判而非整批降级
+        # 截断抢救:抠出所有完整对象,至少保住一部分研判而非整批待重试
         salvaged = salvage_json_objects(text)
         if salvaged:
             return salvaged
@@ -1947,7 +1950,7 @@ def with_codex_retry(config, attempt_fn, label):
 
     只在连接类错误(URLError/超时/不完整读取)上重试——这些是抖动,重试有意义;
     HTTPError(4xx/5xx 业务错误)和已解析的 RuntimeError 立即抛出,重试无益。
-    指数退避。重试事件记入 llm-errors.jsonl 便于在控制台看降级前的抖动。
+    指数退避。重试事件记入 llm-errors.jsonl 便于在控制台看模型抖动。
     """
     max_retries, backoff, factor = _retry_cfg(config)
     delay = backoff
@@ -3014,7 +3017,15 @@ def llm_judge_rows(config, rows):
     if not rows:
         return {}
     if not llm.get("enabled", False):
-        return {judgement_key(row): fallback_judgement(row, "rule_fallback_llm_disabled", model) for row in rows}
+        return {
+            judgement_key(row): retry_pending_judgement(
+                row,
+                "retry_pending_llm_disabled",
+                model,
+                "LLM 研判未启用，未生成本地替代结论；启用模型后自动重试",
+            )
+            for row in rows
+        }
 
     provider = llm.get("provider", "codex_cli")
     routed_batch = router_enabled(config)
@@ -3025,13 +3036,29 @@ def llm_judge_rows(config, rows):
             model = str(route_cfg.get("model") or model)
         except Exception as exc:
             append_llm_error("router", model, [], exc)
-            return {judgement_key(row): fallback_judgement(row, "rule_fallback_router_config_error", model) for row in rows}
-    # 连接预检:provider 为 codex_direct 且接口不可达时,整轮短路,全部降级
-    # (避免每条干等超时;这些会被上层重试队列接住,网络恢复时补判)。
+            return {
+                judgement_key(row): retry_pending_judgement(
+                    row,
+                    "retry_pending_router_config_error",
+                    model,
+                    "模型路由配置异常，未生成研判结论；修复配置后自动重试",
+                )
+                for row in rows
+            }
+    # 连接预检:provider 为 codex_direct 且接口不可达时,整轮短路,全部等待重试。
+    # 避免每条干等超时;这些会被上层重试队列接住,网络恢复时补判。
     if provider == "codex_direct" and not routed_batch and llm.get("precheck", True):
         if not codex_reachable(config, timeout=int(llm.get("precheck_timeout", 6))):
             append_llm_error("precheck", model, [], RuntimeError("codex unreachable, skip LLM this run"))
-            return {judgement_key(row): fallback_judgement(row, "rule_fallback_codex_unreachable", model) for row in rows}
+            return {
+                judgement_key(row): retry_pending_judgement(
+                    row,
+                    "retry_pending_codex_unreachable",
+                    model,
+                    "Codex/模型接口暂不可达，未生成研判结论；恢复后自动重试",
+                )
+                for row in rows
+            }
     batch_size = max(1, int(llm.get("batch_size", 8)))
     max_workers = max(1, int(llm.get("max_workers", 6)))
     batches = [rows[i : i + batch_size] for i in range(0, len(rows), batch_size)]
@@ -3046,14 +3073,24 @@ def llm_judge_rows(config, rows):
         else:
             if not os.getenv("OPENAI_API_KEY"):
                 return {
-                    judgement_key(row): fallback_judgement(row, "rule_fallback_missing_openai_api_key", model)
+                    judgement_key(row): retry_pending_judgement(
+                        row,
+                        "retry_pending_missing_openai_api_key",
+                        model,
+                        "OpenAI 兼容接口缺少 API Key，未生成研判结论；配置后自动重试",
+                    )
                     for row in rows
                 }
             try:
                 from openai import OpenAI
             except Exception:
                 return {
-                    judgement_key(row): fallback_judgement(row, "rule_fallback_openai_sdk_missing", model)
+                    judgement_key(row): retry_pending_judgement(
+                        row,
+                        "retry_pending_openai_sdk_missing",
+                        model,
+                        "OpenAI SDK 不可用，未生成研判结论；依赖恢复后自动重试",
+                    )
                     for row in rows
                 }
             client = OpenAI(timeout=float(llm.get("timeout_seconds", 45)))
@@ -3098,7 +3135,7 @@ def llm_judge_rows(config, rows):
                         "输出Token": str(item_usage.get("output_tokens", "")),
                         "推理Token": str(item_usage.get("reasoning_output_tokens", "")),
                     }
-                    # 写回记忆库(只存真模型结果,降级兜底不污染先验)
+                    # 写回记忆库(只存真模型结果,待重试状态不污染先验)
                     try:
                         import triage_memory
                         triage_memory.remember(
@@ -3109,9 +3146,14 @@ def llm_judge_rows(config, rows):
                     except Exception:
                         pass
                 else:
-                    results[key] = fallback_judgement(row, "rule_fallback_model_parse_error", model)
+                    results[key] = retry_pending_judgement(
+                        row,
+                        "retry_pending_model_parse_error",
+                        model,
+                        "模型返回为空或解析失败，未生成研判结论；后续自动重试",
+                    )
             # 整批 miss 说明该批次解析失败/返回空,记日志使其在控制台可见,
-            # 否则大批降级会静默发生(eval 已暴露过日报批次 90% 降级)。
+            # 否则大批待重试会静默发生。
             miss = sum(1 for row in batch if not by_key.get(judgement_key(row)))
             if miss and miss == len(batch):
                 append_jsonl(LOG_DIR / "llm-errors.jsonl", [{
@@ -3119,8 +3161,8 @@ def llm_judge_rows(config, rows):
                     "provider": provider + "_parse_miss",
                     "model": model,
                     "batch_size": len(batch),
-                    "error_type": "batch_all_fallback",
-                    "error": f"批次 {len(batch)} 条全部降级(解析失败或空响应)",
+                    "error_type": "batch_all_retry_pending",
+                    "error": f"批次 {len(batch)} 条全部待重试(解析失败或空响应)",
                 }])
     results = refine_judgements_with_source(config, rows, results, model)
     return escalate_with_agent(config, rows, results, model)

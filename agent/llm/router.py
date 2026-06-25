@@ -15,7 +15,6 @@ DEFAULT_ROUTES = {
     "agent_triage": "codex_direct",
     "critical_review": "codex_direct",
     "rule_parse": "codex_direct",
-    "fallback": "codex_direct",
 }
 
 
@@ -39,7 +38,7 @@ def provider_configs(config: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
 def routing_config(config: Mapping[str, Any]) -> Dict[str, str]:
     llm = config.get("llm") or {}
     routes = dict(DEFAULT_ROUTES)
-    routes.update({str(k): str(v) for k, v in (llm.get("routing") or {}).items() if v})
+    routes.update({str(k): str(v) for k, v in (llm.get("routing") or {}).items() if str(k) in DEFAULT_ROUTES and v})
     if llm.get("provider") and not llm.get("providers"):
         for key in list(routes):
             routes[key] = str(llm.get("provider"))
@@ -54,7 +53,7 @@ class LLMRouter:
         self.routes = routing_config(config)
 
     def provider_name_for(self, stage: str) -> str:
-        return self.routes.get(stage) or self.routes.get("fallback") or "codex_direct"
+        return self.routes.get(stage) or "codex_direct"
 
     def provider_for(self, stage: str) -> LLMProvider:
         name = self.provider_name_for(stage)
