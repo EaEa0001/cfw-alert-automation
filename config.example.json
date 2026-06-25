@@ -17,6 +17,12 @@
   },
   "lookback_hours": 1,
   "daily_report_time": "17:50",
+  "state_db": {
+    "enabled": false,
+    "dsn_env": "CFW_STATE_DB_DSN",
+    "schema": "public",
+    "connect_timeout_seconds": 5
+  },
   "wecom": {
     "enabled": false,
     "webhook_url": "",

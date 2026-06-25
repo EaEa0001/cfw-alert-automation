@@ -12,6 +12,7 @@ from pathlib import Path
 import requests
 
 import cfw_alert_monitor as monitor
+from agent import state_store
 
 
 ROOT = Path(__file__).resolve().parent
@@ -1433,6 +1434,7 @@ def realtime_triage_once(config, dry_run=False):
     end = now
     start = now - timedelta(minutes=max(1, int(cfg.get("lookback_minutes", 10))))
     records, query = fetch_unhandled_alert_center_range(config, start, end)
+    state_store.record_raw_alerts(config, records, source="realtime_poll")
     records, dedup_stats = merge_forward_duplicates(records)
     processed = state.get("processed") or {}
     new_records = []
@@ -1542,6 +1544,13 @@ def realtime_triage_once(config, dry_run=False):
     })
     dispose_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     result["disposition_file"] = str(dispose_path)
+    state_store.record_triage_result(
+        config,
+        result,
+        judged_rows=judged_rows,
+        ignore_ids=ignore_ids,
+        manual_rows=manual_rows,
+    )
     monitor.append_jsonl(
         DATA_DIR / f"realtime-poll-{now.strftime('%Y-%m-%d')}.jsonl",
         [dict(result, recorded_at=now_text)],
@@ -1630,6 +1639,7 @@ def main():
         records, query = fetch_unhandled_alert_center_range(config, args.start, args.end)
     else:
         records, query = fetch_unhandled_alert_center(config, args.days)
+    state_store.record_raw_alerts(config, records, source="alert_center_triage")
     # 合并容器转发重复告警(一次攻击报两次),研判前去重
     records, dedup_stats = merge_forward_duplicates(records)
     if args.limit:
@@ -1770,6 +1780,7 @@ def main():
 
     white_actions = []
     omit_actions = []
+    manual_rows = []
     manual_push = {"sent": False, "reason": "dry_run" if args.dry_run else "skipped"}
     if not args.dry_run:
         white_actions = allow_scanner_ips(config, rows)
@@ -1805,6 +1816,13 @@ def main():
     dispose_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     monitor.append_jsonl(DATA_DIR / f"alert-center-dispose-{monitor.now_local().strftime('%Y-%m-%d')}.jsonl", [summary])
     summary["disposition_file"] = str(dispose_path)
+    state_store.record_triage_result(
+        config,
+        summary,
+        judged_rows=judged_rows,
+        ignore_ids=ignore_ids,
+        manual_rows=manual_rows,
+    )
     print(json.dumps(summary, ensure_ascii=False))
 
 

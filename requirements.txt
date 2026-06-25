@@ -1,3 +1,4 @@
 requests
 tencentcloud-sdk-python-cfw
 flask
+psycopg2-binary
