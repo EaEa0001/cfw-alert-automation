@@ -249,6 +249,6 @@ CFW.sparkline = (data, w = 78, h = 30, color = "var(--primary)") => {
 
 // Chart.js 通用网格配色
 CFW.axis = (extra = {}) => Object.assign({
-  ticks: { color: "#5e6d8c", font: { family: "JetBrains Mono", size: 10.5 } },
-  grid: { color: "rgba(28,40,64,.7)", drawBorder: false }
+  ticks: { color: "#7f8d9f", font: { family: "JetBrains Mono", size: 10.5 } },
+  grid: { color: "#e7eaef", drawBorder: false }
 }, extra);

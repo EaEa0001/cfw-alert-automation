@@ -104,13 +104,13 @@
       data: {
         labels: w.trend.days,
         datasets: [
-          { type: "bar", label: "告警量", data: w.trend.total, backgroundColor: "rgba(76,201,240,.55)", hoverBackgroundColor: "#4cc9f0", borderRadius: 5, borderSkipped: false, yAxisID: "y", maxBarThickness: 34 },
-          { type: "line", label: "Token(M)", data: w.trend.tokens, borderColor: "#ffb454", backgroundColor: "#ffb454", tension: .4, pointRadius: 3, pointBackgroundColor: "#ffb454", yAxisID: "y1", borderWidth: 2 }
+          { type: "bar", label: "告警量", data: w.trend.total, backgroundColor: "rgba(0,101,253,.58)", hoverBackgroundColor: "#0065fd", borderRadius: 5, borderSkipped: false, yAxisID: "y", maxBarThickness: 34 },
+          { type: "line", label: "Token(M)", data: w.trend.tokens, borderColor: "#d97706", backgroundColor: "#d97706", tension: .4, pointRadius: 3, pointBackgroundColor: "#d97706", yAxisID: "y1", borderWidth: 2 }
         ]
       },
       options: {
         maintainAspectRatio: false, responsive: true,
-        plugins: { legend: { labels: { color: "#93a1bd", boxWidth: 12, font: { size: 11.5 } } } },
+        plugins: { legend: { labels: { color: "#7f8d9f", boxWidth: 12, font: { size: 11.5 } } } },
         scales: { y: CFW.axis({ beginAtZero: true }), y1: CFW.axis({ position: "right", grid: { display: false } }), x: CFW.axis({ grid: { display: false } }) }
       }
     });
@@ -118,12 +118,12 @@
 
   function drawDonut(w) {
     const labels = Object.keys(w.results), data = Object.values(w.results);
-    const colorOf = l => l === "确认成功" ? "#ff4d6d" : l === "需人工复核" ? "#ffb454" : l === "扫描探测" ? "#5e6d8c" : l === "未见成功证据" ? "#4cc9f0" : "#2dd4a7";
+    const colorOf = l => l === "确认成功" ? "#ef4444" : l === "需人工复核" ? "#d97706" : l === "扫描探测" ? "#7f8d9f" : l === "未见成功证据" ? "#0065fd" : "#059669";
     const colors = labels.map(colorOf);
     if (donutChart) donutChart.destroy();
     donutChart = new Chart(CFW.$("#ovDonut"), {
       type: "doughnut",
-      data: { labels, datasets: [{ data, backgroundColor: colors, borderColor: "#0a1120", borderWidth: 3, hoverOffset: 6 }] },
+      data: { labels, datasets: [{ data, backgroundColor: colors, borderColor: "#ffffff", borderWidth: 3, hoverOffset: 6 }] },
       options: { maintainAspectRatio: false, cutout: "62%", plugins: { legend: { display: false } } }
     });
     CFW.$("#ovLegend").innerHTML = labels.map((l, i) =>
@@ -134,7 +134,11 @@
     const box = CFW.$("#ovTicker");
     if (!box) return;
     if (tickerTimer) clearInterval(tickerTimer);
-    const pool = CFW.DEMO.tickerPool;
+    const pool = Array.isArray(CFW.DEMO.tickerPool) ? CFW.DEMO.tickerPool : [];
+    if (!pool.length) {
+      box.innerHTML = `<div class="empty"><div class="big">暂无实时告警流</div><div>有新告警进入后会自动显示。</div></div>`;
+      return;
+    }
     const make = () => {
       const p = pool[Math.floor(Math.random() * pool.length)];
       const now = new Date();
