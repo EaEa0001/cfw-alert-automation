@@ -5,6 +5,7 @@ import json
 import time
 from typing import Any, Dict, Mapping, Optional
 
+from .env import load_ai_env_into_process
 from .providers import LLMProvider, provider_from_config
 
 
@@ -48,6 +49,7 @@ def routing_config(config: Mapping[str, Any]) -> Dict[str, str]:
 class LLMRouter:
     def __init__(self, config: Mapping[str, Any]):
         self.config = config
+        load_ai_env_into_process(config)
         self.providers = provider_configs(config)
         self.routes = routing_config(config)
 
