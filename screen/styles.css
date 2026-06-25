@@ -674,8 +674,7 @@ th.r {
   color: var(--violet);
 }
 
-.src-待模型重试,
-.src-降级兜底 {
+.src-待模型重试 {
   background: var(--warn-dim);
   color: var(--warn);
 }
