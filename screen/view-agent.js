@@ -35,7 +35,7 @@
       label: "GLM",
       name: "glm_fast",
       type: "openai_compatible",
-      model: "glm-4.5-flash",
+      model: "",
       base_url: "https://open.bigmodel.cn/api/paas/v4",
       api_key_env: "GLM_API_KEY",
       json_mode: true,
@@ -45,7 +45,7 @@
       label: "OpenAI / Codex API",
       name: "openai_api",
       type: "openai_compatible",
-      model: "gpt-5.5",
+      model: "",
       base_url: "https://api.openai.com/v1",
       api_key_env: "OPENAI_API_KEY",
       json_mode: true,
@@ -55,7 +55,7 @@
       label: "Claude API",
       name: "claude_api",
       type: "anthropic",
-      model: "claude-sonnet-4-5",
+      model: "",
       api_key_env: "ANTHROPIC_API_KEY",
       max_tokens: 4096,
       timeout_seconds: 240,
@@ -89,6 +89,8 @@
     },
   };
   let newProviderTemplate = "deepseek_fast";
+  let newProviderModelOptions = {};
+  let newProviderModelStatus = {};
   let lastPreview = null;
   let configResult = null;
   let selectedAlertId = "";
@@ -194,6 +196,8 @@
     if (saveTencentAuth) saveTencentAuth.addEventListener("click", saveTencentAuthConfig);
     const templateSelect = CFW.$("#newProviderTemplate", root);
     if (templateSelect) templateSelect.addEventListener("change", e => { newProviderTemplate = e.target.value; CFW.renderAgent(); });
+    const fetchModels = CFW.$("#fetchModelsBtn", root);
+    if (fetchModels) fetchModels.addEventListener("click", fetchNewProviderModels);
     const addProvider = CFW.$("#addProviderBtn", root);
     if (addProvider) addProvider.addEventListener("click", saveNewProviderConfig);
     CFW.$$("[data-provider-save]", root).forEach(b => b.addEventListener("click", () => saveProviderConfig(b.dataset.providerSave)));
@@ -259,32 +263,55 @@
   function newProviderPane(providers, envStatus) {
     const tpl = PROVIDER_TEMPLATES[newProviderTemplate] || PROVIDER_TEMPLATES.custom_openai;
     const nameTaken = !!providers[tpl.name];
+    const modelOptions = newProviderModelOptions[newProviderTemplate] || [];
+    const status = newProviderModelStatus[newProviderTemplate] || "";
+    const needsKey = !!tpl.api_key_env;
+    const isCustom = newProviderTemplate === "custom_openai";
     return `<div class="new-provider-box">
       <div class="flex between">
         <div>
           <b>新增 AI / API Provider</b>
-          <div class="mut small">选择模板后填 API Key；Key 写入服务器环境文件,不进入 config.json。</div>
+          <div class="mut small">选择模板,填一条 API Key,获取模型列表后保存；Key 不进入 config.json。</div>
         </div>
         <select id="newProviderTemplate" class="agent-input provider-template">
           ${Object.entries(PROVIDER_TEMPLATES).map(([key, item]) => `<option value="${esc(key)}" ${key === newProviderTemplate ? "selected" : ""}>${esc(item.label)}</option>`).join("")}
         </select>
       </div>
-      <div class="provider-form new-provider-form" data-new-provider>
-        ${field("Provider 名称", "name", tpl.name)}
-        ${field("类型", "type", tpl.type)}
-        ${field("模型", "model", tpl.model || "")}
-        ${field("API Base", "base_url", tpl.base_url || "")}
-        ${field("API URL", "url", tpl.url || "")}
-        ${field("Key 环境变量", "api_key_env", tpl.api_key_env || "")}
-        ${secretField(tpl.api_key_env || "", envStatus, "new")}
-        ${field("CLI Command", "command", tpl.command || "")}
-        ${field("推理强度", "reasoning_effort", tpl.reasoning_effort || "")}
-        ${field("超时秒", "timeout_seconds", tpl.timeout_seconds || "")}
-        ${field("Max Tokens", "max_tokens", tpl.max_tokens || "")}
-        <label class="inline-check provider-json"><input type="checkbox" data-provider-field="json_mode" ${tpl.json_mode === false ? "" : "checked"}> JSON Mode</label>
+      <div class="quick-provider" data-new-provider>
+        ${hiddenField("name", tpl.name)}
+        ${hiddenField("type", tpl.type)}
+        ${hiddenField("base_url", tpl.base_url || "")}
+        ${hiddenField("url", tpl.url || "")}
+        ${hiddenField("api_key_env", tpl.api_key_env || "")}
+        ${hiddenField("command", Array.isArray(tpl.command) ? tpl.command.join(" ") : (tpl.command || ""))}
+        ${hiddenField("reasoning_effort", tpl.reasoning_effort || "")}
+        ${hiddenField("timeout_seconds", tpl.timeout_seconds || "")}
+        ${hiddenField("max_tokens", tpl.max_tokens || "")}
+        <input type="checkbox" data-provider-field="json_mode" ${tpl.json_mode === false ? "" : "checked"} hidden>
+        <div class="quick-provider-grid">
+          ${needsKey ? secretField(tpl.api_key_env || "", envStatus, "new") : `<div class="quick-provider-note">订阅/本地 CLI 模式无需 API Key</div>`}
+          ${isCustom ? field("API Base", "base_url", tpl.base_url || "") : ""}
+          <div id="newProviderModelWrap">${modelControlHtml(tpl.model || "", modelOptions)}</div>
+          <button class="btn" id="fetchModelsBtn" ${needsKey || isCustom ? "" : "disabled"}>获取模型列表</button>
+        </div>
+        <div class="model-fetch-status" id="newProviderModelStatus">${esc(status)}</div>
+        <details class="provider-advanced">
+          <summary>高级配置</summary>
+          <div class="provider-form advanced-provider-form">
+            ${field("Provider 名称", "name", tpl.name)}
+            ${field("类型", "type", tpl.type)}
+            ${field("API Base", "base_url", tpl.base_url || "")}
+            ${field("API URL", "url", tpl.url || "")}
+            ${field("Key 环境变量", "api_key_env", tpl.api_key_env || "")}
+            ${field("CLI Command", "command", tpl.command || "")}
+            ${field("推理强度", "reasoning_effort", tpl.reasoning_effort || "")}
+            ${field("超时秒", "timeout_seconds", tpl.timeout_seconds || "")}
+            ${field("Max Tokens", "max_tokens", tpl.max_tokens || "")}
+          </div>
+        </details>
       </div>
       <div class="flex between mt-sm">
-        <span class="hint">${nameTaken ? "同名 Provider 已存在,保存会覆盖配置。" : "保存后可在上方路由编辑里选择这个 Provider。"}</span>
+        <span class="hint">${nameTaken ? "同名 Provider 已存在,保存会覆盖配置。" : `保存为 ${esc(tpl.name)},之后可在上方路由编辑里选择。`}</span>
         <button class="btn primary" id="addProviderBtn">保存新增 Provider</button>
       </div>
     </div>`;
@@ -326,6 +353,21 @@
 
   function field(label, key, value) {
     return `<label><span>${esc(label)}</span><input class="agent-input mono" data-provider-field="${esc(key)}" value="${esc(value)}"></label>`;
+  }
+
+  function hiddenField(key, value) {
+    return `<input type="hidden" data-provider-field="${esc(key)}" value="${esc(value)}">`;
+  }
+
+  function modelControlHtml(value, options) {
+    const current = String(value || "");
+    if (Array.isArray(options) && options.length) {
+      const selected = options.includes(current) ? current : options[0];
+      return `<label><span>模型</span><select class="agent-input mono" data-provider-field="model">
+        ${options.map(model => `<option value="${esc(model)}" ${model === selected ? "selected" : ""}>${esc(model)}</option>`).join("")}
+      </select></label>`;
+    }
+    return `<label><span>模型</span><input class="agent-input mono" data-provider-field="model" value="${esc(current)}" placeholder="先获取模型列表"></label>`;
   }
 
   function plainInput(label, id, value) {
@@ -465,6 +507,58 @@
     }
   }
 
+  function collectNewProviderPayload() {
+    const box = CFW.$("[data-new-provider]");
+    const provider = {};
+    const secrets = {};
+    if (!box) return { provider, secrets };
+    CFW.$$("[data-provider-field]", box).forEach(el => {
+      const advanced = el.closest(".provider-advanced");
+      if (advanced && !advanced.open) return;
+      if (el.type === "checkbox") provider[el.dataset.providerField] = !!el.checked;
+      else provider[el.dataset.providerField] = el.value.trim();
+    });
+    provider.name = (provider.name || "").trim();
+    const secretInput = CFW.$("[data-provider-secret]", box);
+    const envName = (provider.api_key_env || secretInput?.dataset.providerSecretEnv || "").trim();
+    const secretValue = (secretInput?.value || "").trim();
+    if (envName && secretValue) secrets[envName] = secretValue;
+    return { provider, secrets };
+  }
+
+  async function fetchNewProviderModels() {
+    const { provider, secrets } = collectNewProviderPayload();
+    const status = CFW.$("#newProviderModelStatus");
+    if (!provider.base_url && String(provider.type || "").includes("openai")) {
+      if (status) status.textContent = "请先填写 API Base";
+      return;
+    }
+    if (status) status.textContent = "正在获取模型列表...";
+    try {
+      const res = await fetch("/api/agent/providers/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider, secrets })
+      });
+      const data = await res.json();
+      if (!data.ok || !Array.isArray(data.models) || !data.models.length) {
+        const msg = data.error ? `获取失败: ${data.error}` : "未返回模型列表";
+        newProviderModelStatus[newProviderTemplate] = msg;
+        if (status) status.textContent = msg;
+        return;
+      }
+      newProviderModelOptions[newProviderTemplate] = data.models;
+      newProviderModelStatus[newProviderTemplate] = `已获取 ${data.models.length} 个模型`;
+      const wrap = CFW.$("#newProviderModelWrap");
+      if (wrap) wrap.innerHTML = modelControlHtml(provider.model || data.models[0], data.models);
+      if (status) status.textContent = newProviderModelStatus[newProviderTemplate];
+    } catch (e) {
+      const msg = "获取失败: " + String(e);
+      newProviderModelStatus[newProviderTemplate] = msg;
+      if (status) status.textContent = msg;
+    }
+  }
+
   async function saveProviderConfig(name) {
     const card = CFW.$$("[data-provider-card]").find(el => el.dataset.providerCard === name);
     if (!card) {
@@ -491,24 +585,18 @@
   }
 
   async function saveNewProviderConfig() {
-    const box = CFW.$("[data-new-provider]");
-    if (!box) return;
-    const provider = {};
-    const secrets = {};
-    CFW.$$("[data-provider-field]", box).forEach(el => {
-      if (el.type === "checkbox") provider[el.dataset.providerField] = !!el.checked;
-      else provider[el.dataset.providerField] = el.value.trim();
-    });
-    provider.name = (provider.name || "").trim();
+    const { provider, secrets } = collectNewProviderPayload();
     if (!provider.name) {
       configResult = { error: "请填写 Provider 名称" };
       CFW.renderAgent();
       return;
     }
-    const secretInput = CFW.$("[data-provider-secret]", box);
-    const envName = (provider.api_key_env || secretInput?.dataset.providerSecretEnv || "").trim();
-    const secretValue = (secretInput?.value || "").trim();
-    if (envName && secretValue) secrets[envName] = secretValue;
+    const apiLike = ["openai_compatible", "openai", "deepseek", "glm", "anthropic", "claude_api"].includes(String(provider.type || "").toLowerCase());
+    if (apiLike && !provider.model) {
+      configResult = { error: "请先获取并选择模型" };
+      CFW.renderAgent();
+      return;
+    }
     try {
       await postConfig({ provider, secrets });
     } catch (e) {

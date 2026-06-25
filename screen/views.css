@@ -865,6 +865,51 @@
   background: var(--muted);
 }
 
+.quick-provider {
+  margin-top: 12px;
+}
+
+.quick-provider-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.2fr) minmax(240px, 1fr) auto;
+  align-items: end;
+  gap: 10px 12px;
+}
+
+.quick-provider-grid .provider-secret {
+  min-width: 0;
+}
+
+.quick-provider-note {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  color: var(--secondary-foreground);
+  font-size: 12.5px;
+}
+
+.model-fetch-status {
+  min-height: 18px;
+  margin-top: 8px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.provider-advanced {
+  margin-top: 10px;
+}
+
+.provider-advanced summary {
+  cursor: pointer;
+  color: var(--secondary-foreground);
+  font-size: 12px;
+  user-select: none;
+}
+
+.advanced-provider-form {
+  margin-top: 10px;
+}
+
 .tencent-auth-box {
   padding: 14px;
   border: 1px solid var(--line);
@@ -1687,6 +1732,10 @@
 
   .provider-template {
     max-width: none;
+  }
+
+  .quick-provider-grid {
+    grid-template-columns: 1fr;
   }
 
   .tencent-auth-grid {

@@ -13,6 +13,8 @@ import ipaddress
 import json
 import os
 import shlex
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from flask import Flask, jsonify, request
@@ -186,6 +188,16 @@ def api_agent_provider_test(provider_name):
     result = LLMRouter(_load_local_config()).test_provider(provider_name, live=live, timeout=timeout)
     status = 200 if result.get("ok") else 400
     return jsonify(result), status
+
+
+@app.route("/api/agent/providers/models", methods=["POST"])
+def api_agent_provider_models():
+    body = request.get_json(silent=True) or {}
+    provider = body.get("provider") if isinstance(body.get("provider"), dict) else {}
+    secrets = body.get("secrets") if isinstance(body.get("secrets"), dict) else {}
+    config = _load_local_config()
+    result = _fetch_provider_models(config, provider, secrets)
+    return jsonify(result)
 
 
 @app.route("/api/agent/llm/config", methods=["POST"])
@@ -585,6 +597,93 @@ def _parse_profiles(value):
         seen.add(text)
         profiles.append(text)
     return profiles
+
+
+def _fetch_provider_models(config, provider, secrets):
+    provider = dict(provider or {})
+    typ = str(provider.get("type") or "").lower()
+    model = str(provider.get("model") or "").strip()
+    if typ in {"codex_direct", "codex_subscription", "local_cli", "claude_cli", "codex_cli", "claude_subscription"}:
+        return {"ok": True, "provider_type": typ, "models": [model] if model else [], "source": "local_config"}
+
+    api_key = _provider_api_key_for_fetch(config, provider, secrets)
+    if not api_key:
+        return {"ok": False, "error": "missing_api_key", "models": []}
+
+    timeout = 12
+    try:
+        timeout = max(3, min(30, int(provider.get("timeout_seconds") or timeout)))
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        if typ in {"anthropic", "claude_api"}:
+            return _fetch_anthropic_models(provider, api_key, timeout)
+        return _fetch_openai_compatible_models(provider, api_key, timeout)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:300]
+        return {"ok": False, "error": f"http_{exc.code}", "detail": body, "models": []}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:300], "models": []}
+
+
+def _provider_api_key_for_fetch(config, provider, secrets):
+    env_name = str((provider or {}).get("api_key_env") or "").strip()
+    if env_name and isinstance(secrets, dict) and secrets.get(env_name):
+        return str(secrets.get(env_name) or "").strip()
+    if isinstance(secrets, dict) and secrets.get("api_key"):
+        return str(secrets.get("api_key") or "").strip()
+    env_values = load_env_file(ai_env_path(config, ROOT))
+    if env_name:
+        return str(os.environ.get(env_name) or env_values.get(env_name) or "").strip()
+    return ""
+
+
+def _fetch_openai_compatible_models(provider, api_key, timeout):
+    base_url = str(provider.get("base_url") or "https://api.openai.com/v1").rstrip("/")
+    url = base_url + "/models"
+    req = urllib.request.Request(
+        url,
+        method="GET",
+        headers={"Authorization": "Bearer " + api_key, "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    models = _extract_model_ids(payload)
+    return {"ok": True, "models": models, "source": url}
+
+
+def _fetch_anthropic_models(provider, api_key, timeout):
+    url = str(provider.get("models_url") or "https://api.anthropic.com/v1/models")
+    req = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": str(provider.get("anthropic_version") or "2023-06-01"),
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    models = _extract_model_ids(payload)
+    return {"ok": True, "models": models, "source": url}
+
+
+def _extract_model_ids(payload):
+    data = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(data, list):
+        return []
+    models = []
+    seen = set()
+    for item in data:
+        model_id = item if isinstance(item, str) else (item or {}).get("id")
+        model_id = str(model_id or "").strip()
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        models.append(model_id)
+    return models[:200]
 
 
 def _parse_command_value(value):
