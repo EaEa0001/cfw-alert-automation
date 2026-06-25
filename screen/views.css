@@ -857,6 +857,18 @@
   background: var(--card);
 }
 
+.new-provider-box {
+  margin-bottom: 14px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--muted);
+}
+
+.provider-template {
+  max-width: 220px;
+}
+
 .mini-card {
   min-height: 112px;
 }
@@ -1249,6 +1261,10 @@
   align-self: end;
 }
 
+.provider-secret input::placeholder {
+  color: var(--muted-foreground);
+}
+
 .provider-command,
 .draft-box,
 .report-copy {
@@ -1604,6 +1620,10 @@
   .rule-tabs,
   .report-switch {
     width: 100%;
+  }
+
+  .provider-template {
+    max-width: none;
   }
 
   .rule-tabs button,

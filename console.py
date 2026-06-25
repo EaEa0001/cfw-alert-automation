@@ -10,6 +10,10 @@
 import argparse
 import ipaddress
 import json
+import os
+import re
+import shlex
+import sys
 from pathlib import Path
 
 from flask import Flask, jsonify, request
@@ -134,6 +138,7 @@ def api_agent_config():
             "rule_parse": dict(llm.get("rule_parse") or {}),
             "routing": dict(router.routes),
             "providers": _sanitize_llm_providers(config),
+            "env": _llm_env_status(config),
         },
         "agent": config.get("agent") or {},
     })
@@ -185,7 +190,7 @@ def api_agent_llm_config_update():
         allowed = {
             "type", "model", "base_url", "url", "api_key_env",
             "reasoning_effort", "timeout_seconds", "json_mode", "max_tokens",
-            "anthropic_version",
+            "anthropic_version", "command", "auth_path", "temperature",
         }
         for key, value in provider_update.items():
             key = str(key)
@@ -200,9 +205,27 @@ def api_agent_llm_config_update():
                     continue
             elif key == "json_mode":
                 current[key] = bool(value)
+            elif key == "command":
+                parsed = _parse_command_value(value)
+                if parsed:
+                    current[key] = parsed
+                else:
+                    current.pop(key, None)
+            elif key == "temperature":
+                try:
+                    current[key] = float(value)
+                except (TypeError, ValueError):
+                    continue
             else:
                 current[key] = str(value)
         providers[name] = current
+
+    secrets_update = body.get("secrets") if isinstance(body.get("secrets"), dict) else None
+    if secrets_update:
+        try:
+            _save_ai_env_values(config, secrets_update)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
 
     routing_update = body.get("routing") if isinstance(body.get("routing"), dict) else None
     if routing_update:
@@ -225,6 +248,7 @@ def api_agent_llm_config_update():
             "rule_parse": dict((config.get("llm") or {}).get("rule_parse") or {}),
             "routing": dict(router.routes),
             "providers": _sanitize_llm_providers(config),
+            "env": _llm_env_status(config),
         },
     })
 
@@ -420,7 +444,9 @@ def _load_local_config():
         if not path.exists():
             continue
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            config = json.loads(path.read_text(encoding="utf-8"))
+            _load_ai_env_into_process(config)
+            return config
         except Exception:
             continue
     return {"llm": {}}
@@ -429,6 +455,125 @@ def _load_local_config():
 def _save_local_config(config):
     path = ROOT / "config.json"
     path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _ai_env_path(config):
+    agent_cfg = config.get("agent") or {}
+    path = str(os.environ.get("CFW_AI_ENV_FILE") or agent_cfg.get("ai_env_file") or "").strip()
+    if not path:
+        path = "/etc/cfw-ai.env" if sys.platform.startswith("linux") else str(ROOT / ".env.ai")
+    return Path(path)
+
+
+def _load_env_file(path):
+    values = {}
+    if not path.exists():
+        return values
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        text = line.strip()
+        if not text or text.startswith("#") or "=" not in text:
+            continue
+        key, value = text.split("=", 1)
+        key = key.strip()
+        if not _valid_env_key(key):
+            continue
+        values[key] = _unquote_env_value(value.strip())
+    return values
+
+
+def _load_ai_env_into_process(config):
+    for key, value in _load_env_file(_ai_env_path(config)).items():
+        if value and key not in os.environ:
+            os.environ[key] = value
+
+
+def _llm_env_status(config):
+    llm = config.get("llm") or {}
+    providers = llm.get("providers") or {}
+    env_values = _load_env_file(_ai_env_path(config))
+    tracked = set()
+    for provider in providers.values():
+        key = str((provider or {}).get("api_key_env") or "").strip()
+        if key:
+            tracked.add(key)
+    tracked.update(k for k in env_values if k.endswith("_API_KEY") or k in {"OPENAI_API_KEY", "DEEPSEEK_API_KEY", "GLM_API_KEY", "ANTHROPIC_API_KEY"})
+    return {
+        "file": str(_ai_env_path(config)),
+        "keys": {
+            key: {
+                "present": bool(os.environ.get(key) or env_values.get(key)),
+                "process": bool(os.environ.get(key)),
+                "file": bool(env_values.get(key)),
+            }
+            for key in sorted(tracked)
+        },
+    }
+
+
+def _save_ai_env_values(config, values):
+    path = _ai_env_path(config)
+    current = _load_env_file(path)
+    changed = False
+    for raw_key, raw_value in values.items():
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        if not _valid_env_key(key):
+            raise ValueError(f"invalid_env_key:{key}")
+        value = str(raw_value or "").strip()
+        if not value:
+            continue
+        current[key] = value
+        os.environ[key] = value
+        changed = True
+    if not changed:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = ["# Managed by CFW SOC console. Do not commit this file."]
+    for key in sorted(current):
+        content.append(f"{key}={_quote_env_value(current[key])}")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("\n".join(content) + "\n", encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    tmp.replace(path)
+
+
+def _valid_env_key(key):
+    return bool(re.fullmatch(r"[A-Z_][A-Z0-9_]*", str(key or "")))
+
+
+def _quote_env_value(value):
+    text = str(value or "")
+    return "'" + text.replace("'", "'\"'\"'") + "'"
+
+
+def _unquote_env_value(value):
+    text = str(value or "")
+    if (text.startswith("'") and text.endswith("'")) or (text.startswith('"') and text.endswith('"')):
+        try:
+            return shlex.split(text)[0]
+        except (ValueError, IndexError):
+            return text[1:-1]
+    return text
+
+
+def _parse_command_value(value):
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return text.split()
 
 
 def _custom_rule_default_days(config):
@@ -529,7 +674,7 @@ def _sanitize_llm_providers(config):
     allowed = {
         "type", "model", "base_url", "url", "api_key_env",
         "reasoning_effort", "timeout_seconds", "json_mode", "max_tokens",
-        "anthropic_version", "command",
+        "anthropic_version", "command", "auth_path", "temperature",
     }
     out = {}
     for name, cfg in providers.items():

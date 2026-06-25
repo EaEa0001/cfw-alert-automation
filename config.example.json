@@ -178,6 +178,7 @@
   },
   "agent": {
     "enabled": false,
+    "ai_env_file": "/etc/cfw-ai.env",
     "policy_guard": {
       "high_alert_requires_evidence": true,
       "cloud_success_never_omit": true,

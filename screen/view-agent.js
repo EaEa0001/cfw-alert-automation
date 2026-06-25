@@ -10,6 +10,85 @@
     rule_parse: "自然语言规则解析",
     fallback: "兜底路由",
   };
+  const PROVIDER_TEMPLATES = {
+    deepseek_fast: {
+      label: "DeepSeek 快速",
+      name: "deepseek_fast",
+      type: "openai_compatible",
+      model: "deepseek-chat",
+      base_url: "https://api.deepseek.com",
+      api_key_env: "DEEPSEEK_API_KEY",
+      json_mode: true,
+      timeout_seconds: 180,
+    },
+    deepseek_reasoner: {
+      label: "DeepSeek 推理",
+      name: "deepseek_reasoner",
+      type: "openai_compatible",
+      model: "deepseek-reasoner",
+      base_url: "https://api.deepseek.com",
+      api_key_env: "DEEPSEEK_API_KEY",
+      json_mode: true,
+      timeout_seconds: 240,
+    },
+    glm_fast: {
+      label: "GLM",
+      name: "glm_fast",
+      type: "openai_compatible",
+      model: "glm-4.5-flash",
+      base_url: "https://open.bigmodel.cn/api/paas/v4",
+      api_key_env: "GLM_API_KEY",
+      json_mode: true,
+      timeout_seconds: 180,
+    },
+    openai_api: {
+      label: "OpenAI / Codex API",
+      name: "openai_api",
+      type: "openai_compatible",
+      model: "gpt-5.5",
+      base_url: "https://api.openai.com/v1",
+      api_key_env: "OPENAI_API_KEY",
+      json_mode: true,
+      timeout_seconds: 300,
+    },
+    claude_api: {
+      label: "Claude API",
+      name: "claude_api",
+      type: "anthropic",
+      model: "claude-sonnet-4-5",
+      api_key_env: "ANTHROPIC_API_KEY",
+      max_tokens: 4096,
+      timeout_seconds: 240,
+    },
+    codex_direct: {
+      label: "Codex 订阅",
+      name: "codex_direct",
+      type: "codex_direct",
+      model: "gpt-5.5",
+      url: "https://chatgpt.com/backend-api/codex/responses",
+      reasoning_effort: "high",
+      timeout_seconds: 300,
+    },
+    claude_subscription: {
+      label: "Claude Code 订阅",
+      name: "claude_subscription",
+      type: "claude_cli",
+      model: "claude-code-subscription",
+      command: "claude -p --output-format text",
+      timeout_seconds: 240,
+    },
+    custom_openai: {
+      label: "自定义 OpenAI 兼容",
+      name: "custom_api",
+      type: "openai_compatible",
+      model: "",
+      base_url: "",
+      api_key_env: "CUSTOM_API_KEY",
+      json_mode: true,
+      timeout_seconds: 180,
+    },
+  };
+  let newProviderTemplate = "deepseek_fast";
   let lastPreview = null;
   let configResult = null;
   let selectedAlertId = "";
@@ -22,6 +101,7 @@
     const routes = settings.routing || routing.routes || {};
     const providers = settings.providers || routing.providers || {};
     const health = agent.provider_health || {};
+    const envStatus = settings.env || {};
     const alerts = Array.isArray(CFW.DEMO.agentAlerts) ? CFW.DEMO.agentAlerts : [];
     const providerNames = Object.keys(providers);
     if (!selectedAlertId && alerts[0]) selectedAlertId = alerts[0]["告警ID"] || "";
@@ -62,8 +142,9 @@
 
       <div class="panel mt">
         <h2>Provider / API 配置 <span class="hint">支持 Codex/Claude 订阅,以及 OpenAI 兼容 API(DeepSeek/GLM/Codex API)</span></h2>
+        ${newProviderPane(providers, envStatus)}
         <div class="provider-grid">
-          ${providerNames.map(name => providerCard(name, providers[name] || {}, health[name] || {})).join("") || `<div class="mut">未配置 Provider</div>`}
+          ${providerNames.map(name => providerCard(name, providers[name] || {}, health[name] || {}, envStatus)).join("") || `<div class="mut">未配置 Provider</div>`}
         </div>
       </div>
 
@@ -103,6 +184,10 @@
     if (policyPreview) policyPreview.addEventListener("click", () => previewTriage(false));
     const agentPreview = CFW.$("#agentPreviewBtn", root);
     if (agentPreview) agentPreview.addEventListener("click", () => previewTriage(true));
+    const templateSelect = CFW.$("#newProviderTemplate", root);
+    if (templateSelect) templateSelect.addEventListener("change", e => { newProviderTemplate = e.target.value; CFW.renderAgent(); });
+    const addProvider = CFW.$("#addProviderBtn", root);
+    if (addProvider) addProvider.addEventListener("click", saveNewProviderConfig);
     CFW.$$("[data-provider-save]", root).forEach(b => b.addEventListener("click", () => saveProviderConfig(b.dataset.providerSave)));
     CFW.$$("[data-provider-test]", root).forEach(b => b.addEventListener("click", () => testProviderConfig(b.dataset.providerTest)));
     CFW.$$("[data-alert-select]", root).forEach(b => b.addEventListener("click", () => selectAlert(decodeURIComponent(b.dataset.alertSelect || ""))));
@@ -132,7 +217,41 @@
     </label>`;
   }
 
-  function providerCard(name, provider, health) {
+  function newProviderPane(providers, envStatus) {
+    const tpl = PROVIDER_TEMPLATES[newProviderTemplate] || PROVIDER_TEMPLATES.custom_openai;
+    const nameTaken = !!providers[tpl.name];
+    return `<div class="new-provider-box">
+      <div class="flex between">
+        <div>
+          <b>新增 AI / API Provider</b>
+          <div class="mut small">选择模板后填 API Key；Key 写入服务器环境文件,不进入 config.json。</div>
+        </div>
+        <select id="newProviderTemplate" class="agent-input provider-template">
+          ${Object.entries(PROVIDER_TEMPLATES).map(([key, item]) => `<option value="${esc(key)}" ${key === newProviderTemplate ? "selected" : ""}>${esc(item.label)}</option>`).join("")}
+        </select>
+      </div>
+      <div class="provider-form new-provider-form" data-new-provider>
+        ${field("Provider 名称", "name", tpl.name)}
+        ${field("类型", "type", tpl.type)}
+        ${field("模型", "model", tpl.model || "")}
+        ${field("API Base", "base_url", tpl.base_url || "")}
+        ${field("API URL", "url", tpl.url || "")}
+        ${field("Key 环境变量", "api_key_env", tpl.api_key_env || "")}
+        ${secretField(tpl.api_key_env || "", envStatus, "new")}
+        ${field("CLI Command", "command", tpl.command || "")}
+        ${field("推理强度", "reasoning_effort", tpl.reasoning_effort || "")}
+        ${field("超时秒", "timeout_seconds", tpl.timeout_seconds || "")}
+        ${field("Max Tokens", "max_tokens", tpl.max_tokens || "")}
+        <label class="inline-check provider-json"><input type="checkbox" data-provider-field="json_mode" ${tpl.json_mode === false ? "" : "checked"}> JSON Mode</label>
+      </div>
+      <div class="flex between mt-sm">
+        <span class="hint">${nameTaken ? "同名 Provider 已存在,保存会覆盖配置。" : "保存后可在上方路由编辑里选择这个 Provider。"}</span>
+        <button class="btn primary" id="addProviderBtn">保存新增 Provider</button>
+      </div>
+    </div>`;
+  }
+
+  function providerCard(name, provider, health, envStatus) {
     const ok = health.ok === true;
     const command = Array.isArray(provider.command) ? provider.command.join(" ") : (provider.command || "");
     return `<div class="provider-card" data-provider-card="${esc(name)}">
@@ -149,6 +268,8 @@
         ${field("API Base", "base_url", provider.base_url || "")}
         ${field("API URL", "url", provider.url || "")}
         ${field("Key 环境变量", "api_key_env", provider.api_key_env || "")}
+        ${secretField(provider.api_key_env || "", envStatus, name)}
+        ${field("CLI Command", "command", command)}
         ${field("推理强度", "reasoning_effort", provider.reasoning_effort || "")}
         ${field("超时秒", "timeout_seconds", provider.timeout_seconds || "")}
         ${field("Max Tokens", "max_tokens", provider.max_tokens || "")}
@@ -166,6 +287,17 @@
 
   function field(label, key, value) {
     return `<label><span>${esc(label)}</span><input class="agent-input mono" data-provider-field="${esc(key)}" value="${esc(value)}"></label>`;
+  }
+
+  function secretField(envName, envStatus, owner) {
+    const env = String(envName || "").trim();
+    const info = env ? (((envStatus || {}).keys || {})[env] || {}) : {};
+    const present = !!info.present;
+    const hint = env ? `${env} · ${present ? "已配置" : "未配置"}` : "先填写 Key 环境变量";
+    return `<label class="provider-secret">
+      <span>API Key</span>
+      <input class="agent-input mono" type="password" data-provider-secret="${esc(owner)}" data-provider-secret-env="${esc(env)}" placeholder="${esc(hint)}">
+    </label>`;
   }
 
   function alertRow(row) {
@@ -260,14 +392,46 @@
       return;
     }
     const provider = { name };
+    const secrets = {};
     CFW.$$("[data-provider-field]", card).forEach(el => {
       if (el.type === "checkbox") provider[el.dataset.providerField] = !!el.checked;
       else provider[el.dataset.providerField] = el.value.trim();
     });
+    const secretInput = CFW.$("[data-provider-secret]", card);
+    const envName = (provider.api_key_env || secretInput?.dataset.providerSecretEnv || "").trim();
+    const secretValue = (secretInput?.value || "").trim();
+    if (envName && secretValue) secrets[envName] = secretValue;
     try {
-      await postConfig({ provider });
+      await postConfig({ provider, secrets });
     } catch (e) {
       configResult = { provider: name, error: String(e) };
+      CFW.renderAgent();
+    }
+  }
+
+  async function saveNewProviderConfig() {
+    const box = CFW.$("[data-new-provider]");
+    if (!box) return;
+    const provider = {};
+    const secrets = {};
+    CFW.$$("[data-provider-field]", box).forEach(el => {
+      if (el.type === "checkbox") provider[el.dataset.providerField] = !!el.checked;
+      else provider[el.dataset.providerField] = el.value.trim();
+    });
+    provider.name = (provider.name || "").trim();
+    if (!provider.name) {
+      configResult = { error: "请填写 Provider 名称" };
+      CFW.renderAgent();
+      return;
+    }
+    const secretInput = CFW.$("[data-provider-secret]", box);
+    const envName = (provider.api_key_env || secretInput?.dataset.providerSecretEnv || "").trim();
+    const secretValue = (secretInput?.value || "").trim();
+    if (envName && secretValue) secrets[envName] = secretValue;
+    try {
+      await postConfig({ provider, secrets });
+    } catch (e) {
+      configResult = { provider: provider.name, error: String(e) };
       CFW.renderAgent();
     }
   }
