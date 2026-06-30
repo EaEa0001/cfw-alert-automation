@@ -642,6 +642,7 @@ th.r {
 }
 
 .res-扫描探测,
+.res-转发重复告警,
 .res-未见成功证据,
 .res-确认未成功 {
   color: var(--secondary-foreground);

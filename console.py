@@ -9,12 +9,15 @@
 """
 import argparse
 import configparser
+import hashlib
 import ipaddress
 import json
 import os
+import re
 import shlex
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from flask import Flask, jsonify, request
@@ -37,6 +40,8 @@ LEGACY_WHITELIST_CANDIDATES = [
         "reason": "历史规则候选: 初始版本将该 IP 标记为 company_scan",
     },
 ]
+MANUAL_ACTIONS_PATH = ROOT / "data" / "manual-actions.jsonl"
+BLOCK_IP_CONFIRM_TOKEN = "CONFIRM_TENCENT_CFW_BLOCK"
 
 
 @app.route("/")
@@ -100,10 +105,9 @@ def api_pipeline():
 def api_reports_summary():
     days = _days()
     alerts = stats.alerts(days, limit=500)
-    key_results = {"确认成功", "需人工复核"}
     key_alerts = [
         row for row in alerts
-        if row.get("模型研判") in key_results or row.get("告警等级") == "高危"
+        if stats.requires_manual_attention(row)
     ][:12]
     return jsonify({
         "days": days,
@@ -366,6 +370,13 @@ def api_agent_tencent_block_ip():
             rule = draft
     comment = str(body.get("comment") or rule.get("source_text") or "natural language block ip")
     dry_run = body.get("dry_run", True)
+    wants_execute = dry_run is False or str(dry_run).strip().lower() in {"0", "false", "no", "off"}
+    if wants_execute:
+        return jsonify({
+            "error": "manual_block_required",
+            "status": "blocked",
+            "reason": "平台不自动调用腾讯云封禁，请人工在腾讯云控制台执行",
+        }), 403
     result = center.create_block_ip_rules(
         _load_local_config(),
         ips,
@@ -413,6 +424,22 @@ def api_agent_triage_preview():
             run_model=run_model,
         )
     status = 404 if result.get("error") else 200
+    return jsonify(result), status
+
+
+@app.route("/api/agent/alerts/<path:alert_id>/handle", methods=["POST"])
+def api_agent_alert_handle(alert_id):
+    body = request.get_json(silent=True) or {}
+    action = str(body.get("action") or "").strip()
+    row = _find_alert_row(alert_id)
+    if not row:
+        return jsonify({"error": "alert_not_found", "alert_id": alert_id}), 404
+
+    try:
+        result = _handle_alert_action(row, action, body)
+    except ValueError as exc:
+        return jsonify({"error": str(exc), "alert_id": alert_id}), 400
+    status = 400 if result.get("error") else 200
     return jsonify(result), status
 
 
@@ -815,18 +842,11 @@ def _auto_tencent_block_if_requested(rule, body):
         return None
     if str((rule or {}).get("action") or "") != "block_ip":
         return {"status": "skipped", "reason": "rule_action_not_block_ip"}
-    import cfw_alert_center_triage as center
-
-    match = (rule or {}).get("match") if isinstance((rule or {}).get("match"), dict) else {}
-    ips = (rule or {}).get("ips") or match.get("src_ips") or []
-    comment = str((body or {}).get("comment") or (rule or {}).get("source_text") or "custom rule block ip")
-    return center.create_block_ip_rules(
-        _load_local_config(),
-        ips,
-        comment=comment,
-        dry_run=False,
-        confirm_token=str((body or {}).get("confirm") or ""),
-    )
+    return {
+        "status": "skipped",
+        "reason": "manual_block_required",
+        "message": "平台不自动调用腾讯云封禁，请人工在腾讯云控制台执行",
+    }
 
 
 def _propose_rule_with_llm(text, alert, config=None):
@@ -857,6 +877,244 @@ def _propose_rule_with_llm(text, alert, config=None):
         fallback["llm_error"] = str(exc)[:500]
         fallback.setdefault("notes", []).append("LLM解析失败,已回退本地规则解析")
         return fallback
+
+
+def _find_alert_row(alert_id):
+    alert_id = str(alert_id or "")
+    if not alert_id:
+        return None
+    for row in stats.alerts(60, limit=10000):
+        if str(row.get("告警ID") or "") == alert_id:
+            return row
+    return None
+
+
+def _split_first(value):
+    for item in re.split(r"[|,\s]+", str(value or "")):
+        item = item.strip()
+        if item:
+            return item
+    return ""
+
+
+def _ips_from_row_values(*values):
+    ips = []
+    seen = set()
+    for value in values:
+        for item in re.findall(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b", str(value or "")):
+            if item in seen:
+                continue
+            seen.add(item)
+            ips.append(item)
+    return ips
+
+
+def _is_global_ipv4(value):
+    try:
+        ip = ipaddress.ip_address(str(value or "").strip())
+        return ip.version == 4 and ip.is_global
+    except ValueError:
+        return False
+
+
+def _alert_match(row):
+    rule_id = _split_first(row.get("规则ID"))
+    src_ip = _split_first(row.get("攻击IP") or row.get("源IP"))
+    dst_ip = _split_first(row.get("目标IP"))
+    return {
+        "event_name": row.get("事件名称", ""),
+        "rule_id": rule_id,
+        "src_ip": src_ip,
+        "dst_ip": dst_ip,
+        "direction": str(row.get("方向") or ""),
+    }
+
+
+def _rule_expires(days=30):
+    try:
+        days = max(1, min(365, int(days)))
+    except (TypeError, ValueError):
+        days = 30
+    return (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _manual_action_id(entry):
+    raw = json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "ma_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _append_manual_action(entry):
+    entry = dict(entry)
+    entry.setdefault("created_at", _now_text())
+    entry.setdefault("operator", "console")
+    entry.setdefault("status", "handled")
+    entry.setdefault("status_label", "已处理")
+    entry["action_id"] = _manual_action_id(entry)
+    MANUAL_ACTIONS_PATH.parent.mkdir(exist_ok=True)
+    with MANUAL_ACTIONS_PATH.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+    return entry
+
+
+def _action_response(row, entry, rule=None, tencent_block=None):
+    alert_id = row.get("告警ID", "")
+    refreshed = _find_alert_row(alert_id) or row
+    response = {
+        "ok": not bool(entry.get("error")),
+        "alert_id": alert_id,
+        "action": entry,
+        "alert": refreshed,
+    }
+    if rule is not None:
+        response["rule"] = rule
+    if tencent_block is not None:
+        response["tencent_block"] = tencent_block
+    if entry.get("error"):
+        response["error"] = entry["error"]
+    return response
+
+
+def _handle_alert_action(row, action, body):
+    alert_id = str(row.get("告警ID") or "")
+    note = str(body.get("note") or "").strip()
+    days = body.get("days", 30)
+    snapshot = {
+        "time": row.get("告警时间", ""),
+        "level": row.get("告警等级", ""),
+        "event": row.get("事件名称", ""),
+        "result": row.get("模型研判", ""),
+        "reason": row.get("研判理由", ""),
+        "key_evidence": row.get("关键证据", ""),
+        "source": row.get("攻击IP", ""),
+        "target": row.get("目标IP", ""),
+        "asset": row.get("目标资产", ""),
+    }
+
+    if action == "reopen":
+        entry = _append_manual_action({
+            "alert_id": alert_id,
+            "action": action,
+            "action_label": "撤销处理",
+            "status": "reopened",
+            "status_label": "已撤销",
+            "note": note,
+            "alert_snapshot": snapshot,
+        })
+        return _action_response(row, entry)
+
+    if action == "mark_handled":
+        entry = _append_manual_action({
+            "alert_id": alert_id,
+            "action": action,
+            "action_label": "人工确认已处理",
+            "status": "handled",
+            "status_label": "已处理",
+            "note": note or "人工确认已完成线下处置",
+            "alert_snapshot": snapshot,
+        })
+        return _action_response(row, entry)
+
+    if action == "block_source":
+        candidates = _ips_from_row_values(
+            body.get("target_ip"),
+            row.get("处置对象"),
+            row.get("真实攻击源"),
+            row.get("攻击IP"),
+        )
+        target_ip = next((ip for ip in candidates if _is_global_ipv4(ip)), "")
+        if not target_ip:
+            raise ValueError("no_public_disposition_ip")
+        comment = f"CFW待人工封禁 {alert_id} {row.get('事件名称', '')}"[:120]
+        rule = {
+            "type": "ip_blocklist",
+            "source_text": comment,
+            "match": {"src_ips": [target_ip]},
+            "ips": [target_ip],
+            "action": "block_ip",
+            "scope": "ip_list",
+            "status": "draft",
+            "trusted_source": False,
+            "requires_human_confirm": True,
+            "expires_at": _rule_expires(days),
+            "created_at": _now_text(),
+            "notes": ["由告警研判台登记封禁建议；平台不自动调用腾讯云，请人工到腾讯云执行"],
+        }
+        saved = CustomRuleStore().save_rule(rule, activate=False)
+        entry = _append_manual_action({
+            "alert_id": alert_id,
+            "action": action,
+            "action_label": "待人工封禁",
+            "status": "pending",
+            "status_label": "待人工",
+            "target_ip": target_ip,
+            "rule_id": saved.get("rule_id", ""),
+            "note": note or "已登记封禁对象，需人工到腾讯云执行；完成后点标记已处理",
+            "alert_snapshot": snapshot,
+        })
+        return _action_response(row, entry, rule=saved)
+
+    if action == "false_positive":
+        match = {k: v for k, v in _alert_match(row).items() if v}
+        rule = {
+            "type": "trusted_false_positive",
+            "source_text": f"告警 {alert_id} 人工确认业务误报",
+            "match": match,
+            "action": "skip_llm_and_omit",
+            "scope": "same_src_same_dst_same_rule",
+            "status": "active",
+            "trusted_source": True,
+            "requires_human_confirm": False,
+            "expires_at": _rule_expires(days),
+            "created_at": _now_text(),
+            "notes": ["由告警研判台一键标记误报创建，按源IP+目标IP+规则ID+事件名窄匹配"],
+        }
+        saved = CustomRuleStore().save_rule(rule, activate=True)
+        entry = _append_manual_action({
+            "alert_id": alert_id,
+            "action": action,
+            "action_label": "业务误报加白",
+            "status": "handled",
+            "status_label": "已处理",
+            "rule_id": saved.get("rule_id", ""),
+            "note": note or "已创建业务误报白名单规则",
+            "alert_snapshot": snapshot,
+        })
+        return _action_response(row, entry, rule=saved)
+
+    if action == "scanner_whitelist":
+        candidates = _ips_from_row_values(body.get("target_ip"), row.get("真实攻击源"), row.get("攻击IP"))
+        src_ip = candidates[0] if candidates else ""
+        if not src_ip:
+            raise ValueError("missing_scanner_ip")
+        rule = {
+            "type": "scanner_whitelist",
+            "source_text": f"告警 {alert_id} 人工确认受控扫描源",
+            "match": {"src_ip": src_ip},
+            "ips": [src_ip],
+            "action": "allow_scanner_ip",
+            "scope": "same_src_ip",
+            "status": "active",
+            "trusted_source": True,
+            "requires_human_confirm": False,
+            "expires_at": _rule_expires(days),
+            "created_at": _now_text(),
+            "notes": ["由告警研判台一键扫描源白名单创建"],
+        }
+        saved = CustomRuleStore().save_rule(rule, activate=True)
+        entry = _append_manual_action({
+            "alert_id": alert_id,
+            "action": action,
+            "action_label": "扫描源白名单",
+            "status": "handled",
+            "status_label": "已处理",
+            "target_ip": src_ip,
+            "rule_id": saved.get("rule_id", ""),
+            "note": note or "已创建扫描源白名单规则",
+            "alert_snapshot": snapshot,
+        })
+        return _action_response(row, entry, rule=saved)
+
+    raise ValueError("unknown_action")
 
 
 def _find_alert_task(alert_id):

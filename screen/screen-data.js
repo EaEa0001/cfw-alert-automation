@@ -30,7 +30,7 @@
         total: ov.total || 0,
         auto: ov.auto_ignored || 0,
         ignoreRate: ov.ignore_rate || 0,
-        manual: (ov.results || {})["需人工复核"] || ov.retained || 0,
+        manual: ov.manual_required || 0,
         success: (ov.results || {})["确认成功"] || 0,
       },
       deltas: { total: "", auto: "", manual: "", success: "" },
@@ -115,6 +115,8 @@
       localAdvice: a["本地建议"] || "",
       whiteState: a["白名单状态"] || "",
       result: a["模型研判"] || "",
+      manualRequired: !!a["需人工关注"],
+      autoIgnored: !!a["自动忽略"],
       source: a["研判来源"] || "",
       sourceRaw: a["研判来源原始"] || "",
       model: a["研判模型"] || "",
@@ -130,6 +132,20 @@
       key: a["关键证据"] || "",
       next: a["下一步"] || "",
       trace: a["工具轨迹"] || "",
+      rootSourceIp: a["真实攻击源"] || a["root_source_ip"] || "",
+      observedSourceIp: a["观测源"] || a["observed_source_ip"] || "",
+      intermediateAsset: a["中间节点"] || a["intermediate_asset"] || "",
+      dispositionTarget: a["处置对象"] || a["disposition_target"] || "",
+      traceType: a["链路类型"] || a["trace_type"] || "",
+      manualHandled: !!a["人工已处理"],
+      manualActionStatus: a["人工处理状态"] || "",
+      manualActionStatusText: a["人工处理状态文本"] || "",
+      manualActionLabel: a["人工处理动作文本"] || "",
+      manualActionTime: a["人工处理时间"] || "",
+      manualActionUser: a["人工处理人"] || "",
+      manualActionNote: a["人工处理备注"] || "",
+      manualActionTarget: a["人工处理目标"] || "",
+      manualActionRuleId: a["人工处理规则ID"] || "",
       raw: a,
     };
   });
@@ -149,6 +165,11 @@
       internal: !!p.internal,
       country: p.country || (p.internal ? "内网" : ""),
       type: p.attacker_type || p.type || "未分类",
+      profileRole: p.profile_role || p.attacker_type || p.type || "未分类",
+      actorBasis: p.actor_basis || "攻击源",
+      observedSources: Array.isArray(p.observed_sources) ? p.observed_sources : [],
+      forwardedCount: p.forwarded_count || 0,
+      safeCount: p.safe_count || 0,
       intent: p.intent || "—",
       stage: p.stage || p.killchain_max || "探测",
       killchainMax: p.killchain_max || p.stage || "探测",
@@ -183,7 +204,7 @@
     const s = ov.sources || {};
     const total = ov.total || 0;
     const auto = ov.auto_ignored || 0;
-    const retained = ov.retained || (ov.results || {})["需人工复核"] || 0;
+    const retained = ov.manual_required || ov.retained || 0;
     return [
       // intake 两格(raw=入库总量 / noise=自动处置后),view 的 .intake 需要两格
       { key: "raw", label: "入库告警", n: total, tone: "primary",
@@ -201,6 +222,33 @@
       { key: "keep", label: "保留人工复核", n: retained, tone: "danger",
         note: "需人工复核 + 确认成功" },
     ];
+  }
+
+  function updateRuntimeStatus(agent, pipeline) {
+    agent = agent || {};
+    pipeline = pipeline || {};
+    const settings = agent.llm_settings || {};
+    const routing = settings.routing || (agent.model_routing || {}).routes || {};
+    const providers = settings.providers || (agent.model_routing || {}).providers || {};
+    const routeName = routing.batch_triage || routing.source_review || routing.agent_triage || Object.keys(providers)[0] || "";
+    const provider = providers[routeName] || {};
+    const model = provider.model || "";
+    const modelEl = document.getElementById("runtimeModel");
+    if (modelEl) {
+      const label = [routeName, model].filter(Boolean).join(" · ") || "模型未配置";
+      modelEl.innerHTML = `<span style="width:14px;color:var(--primary)">${CFW.ICON.shield || ""}</span> ${CFW.esc(label)}`;
+    }
+
+    const cfg = pipeline.config || {};
+    const statusEl = document.getElementById("runtimeStatus");
+    if (statusEl) {
+      const parts = [];
+      parts.push(cfg.realtime_enabled === false ? "实时轮询关闭" : `每 ${cfg.interval_seconds || 60}s 轮询`);
+      parts.push(cfg.auto_dispose === false ? "自动处置关闭" : "自动忽略开启");
+      if (cfg.manual_push_enabled !== false) parts.push("人工项推企微");
+      if (cfg.daily_report_enabled !== false) parts.push(`日报 ${cfg.daily_report_time || "17:50"}`);
+      statusEl.innerHTML = `<span class="dot live"></span> ${CFW.esc(parts.join(" · "))}`;
+    }
   }
 
   // 计算 delta(本期 vs 上一等长周期)
@@ -226,13 +274,13 @@
       const pr = {
         total: (ovPrev.total || 0) - (ov.total || 0),
         auto: (ovPrev.auto_ignored || 0) - (ov.auto_ignored || 0),
-        manual: ((ovPrev.results || {})["需人工复核"] || 0) - ((ov.results || {})["需人工复核"] || 0),
+        manual: (ovPrev.manual_required || 0) - (ov.manual_required || 0),
         success: ((ovPrev.results || {})["确认成功"] || 0) - ((ov.results || {})["确认成功"] || 0),
       };
       win.deltas = {
         total: pct(ov.total || 0, pr.total),
         auto: pct(ov.auto_ignored || 0, pr.auto),
-        manual: pct((ov.results || {})["需人工复核"] || 0, pr.manual),
+        manual: pct(ov.manual_required || 0, pr.manual),
         success: "+" + ((ov.results || {})["确认成功"] || 0),
       };
     }
@@ -252,6 +300,7 @@
     CFW.DEMO.customRules = rules || [];
     CFW.DEMO.whitelistConfig = whitelist || { tencent_scan_ips: [], company_scan_ips: [], whitelist_ips: [], counts: {} };
     CFW.DEMO.agentAlerts = Array.isArray(agentAlerts) ? agentAlerts : [];
+    updateRuntimeStatus(CFW.DEMO.agent, CFW.DEMO.pipelineStatus);
     // 效能视图"近7天累计成效"固定读 windows[7],确保它也是真实值
     if (days !== 7) {
       const [ov7, tr7] = await Promise.all([API("overview", 7), API("trend", 7)]);
@@ -260,7 +309,7 @@
     // 侧栏"告警研判台"徽章 = 真实需人工复核条数
     const tb = document.getElementById("triageBadge");
     if (tb) {
-      const manual = (ov && (ov.results || {})["需人工复核"]) || 0;
+      const manual = (ov && ov.manual_required) || 0;
       tb.textContent = manual;
       tb.style.display = manual ? "" : "none";
     }

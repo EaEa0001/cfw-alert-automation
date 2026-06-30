@@ -8,8 +8,8 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="styles.css?v=20260625-model-fetch1">
-<link rel="stylesheet" href="views.css?v=20260625-model-fetch1">
+<link rel="stylesheet" href="styles.css?v=20260626-trace-chain">
+<link rel="stylesheet" href="views.css?v=20260630-one-click-actions">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -38,8 +38,8 @@
     </nav>
 
     <div class="side-foot">
-      <div class="flex"><span data-ic="shield" style="width:14px;color:var(--primary)"></span> codex_direct · gpt-5.5</div>
-      <div class="row"><span class="dot live"></span> 小时任务运行中 · 不自动封禁</div>
+      <div class="flex" id="runtimeModel"><span data-ic="shield" style="width:14px;color:var(--primary)"></span> 加载模型配置</div>
+      <div class="row" id="runtimeStatus"><span class="dot live"></span> 加载运行状态</div>
     </div>
   </aside>
 
@@ -77,14 +77,14 @@
 
 <script src="core.js?v=20260625-model-fetch1"></script>
 <script src="icons.js?v=20260625-model-fetch1"></script>
-<script src="view-overview.js?v=20260625-model-fetch1"></script>
+<script src="view-overview.js?v=20260626-trace-chain"></script>
 <script src="view-pipeline.js?v=20260625-model-fetch1"></script>
-<script src="view-triage.js?v=20260625-model-fetch1"></script>
-<script src="view-attackers.js?v=20260625-model-fetch1"></script>
-<script src="view-lists.js?v=20260625-model-fetch1"></script>
-<script src="view-agent.js?v=20260625-model-fetch1"></script>
+<script src="view-triage.js?v=20260630-one-click-actions"></script>
+<script src="view-attackers.js?v=20260629-profile-rule1"></script>
+<script src="view-lists.js?v=20260630-manual-block"></script>
+<script src="view-agent.js?v=20260630-manual-block"></script>
 <script src="view-reports.js?v=20260625-model-fetch1"></script>
-<script src="screen-data.js?v=20260625-model-fetch1"></script>
+<script src="screen-data.js?v=20260630-one-click-actions"></script>
 <script src="app.js?v=20260625-model-fetch1"></script>
 <script>
   // 注入侧栏图标

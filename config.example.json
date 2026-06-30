@@ -35,7 +35,46 @@
     "manual_at_all": true,
     "manual_max_items": 6,
     "manual_webhook_url": "",
-    "hourly_at_all_on_critical": false
+    "hourly_at_all_on_critical": false,
+    "smartsheet": {
+      "enabled": false,
+      "webhook_url": "",
+      "batch_size": 100,
+      "timeout_seconds": 15,
+      "dedupe": true,
+      "state_file": "data/wecom-smartsheet-state.json",
+      "required_fields": [
+        "告警时间",
+        "告警ID",
+        "研判结果"
+      ],
+      "schema": {},
+      "field_ids": {
+        "告警时间": "",
+        "告警ID": "",
+        "等级": "",
+        "事件名称": "",
+        "攻击源": "",
+        "观测源": "",
+        "目标": "",
+        "目标资产": "",
+        "研判结果": "",
+        "模型研判": "",
+        "研判理由": "",
+        "置信度": "",
+        "是否需人工": "",
+        "证据来源": "",
+        "关键证据": "",
+        "处置建议": "",
+        "处置对象": "",
+        "研判来源": "",
+        "工具轨迹": "",
+        "链路类型": "",
+        "Token": "",
+        "写入时间": "",
+        "原始详情": ""
+      }
+    }
   },
   "realtime_triage": {
     "enabled": true,

@@ -38,9 +38,9 @@
 
     root.innerHTML = `
       <div class="grid g-4">
-        <div class="kpi tone-primary"><div class="k-label">画像攻击者</div><div class="k-num">${list.length}</div><div class="k-foot">按攻击源 IP 聚合</div></div>
-        <div class="kpi tone-danger"><div class="k-label">高危画像</div><div class="k-num">${bands["高危"]}</div><div class="k-foot">需立即处置</div></div>
-        <div class="kpi tone-warn"><div class="k-label">内网来源</div><div class="k-num">${list.filter(p => p.internal).length}</div><div class="k-foot">横向 / 异常外联</div></div>
+        <div class="kpi tone-primary"><div class="k-label">画像对象</div><div class="k-num">${list.length}</div><div class="k-foot">按处置对象 / 真实攻击源聚合</div></div>
+        <div class="kpi tone-danger"><div class="k-label">高危画像</div><div class="k-num">${bands["高危"]}</div><div class="k-foot">存在成功或落地证据</div></div>
+        <div class="kpi tone-warn"><div class="k-label">内网对象</div><div class="k-num">${list.filter(p => p.internal).length}</div><div class="k-foot">不等同默认封禁对象</div></div>
         <div class="kpi tone-ok"><div class="k-label">已得手</div><div class="k-num">${list.filter(p => p.success > 0).length}</div><div class="k-foot">存在真实落地证据</div></div>
       </div>
 
@@ -67,11 +67,14 @@
     const chainMax = stageLabel(p.killchainMax);
     const evs = Object.entries(p.events).sort((a, b) => b[1] - a[1])
       .map(([k, v]) => `<span class="chip">${esc(k)}<span class="x">×${v}</span></span>`).join("");
+    const observed = (p.observedSources || []).slice(0, 3).join(", ");
+    const basis = p.actorBasis ? `按${p.actorBasis}聚合` : "";
+    const forwarded = p.forwardedCount ? ` · 转发重复 ${p.forwardedCount}` : "";
     return `<div class="atk-card" style="--c:${c}">
       <div class="atk-head">
         <div>
           <div class="atk-ip mono">${p.internal ? "🏠" : "🌐"} ${esc(p.ip)}</div>
-          <div class="atk-sub">${p.internal ? "内网源" : "公网源 · " + esc(p.country)} · ${esc(p.type)} · 意图 ${esc(p.intent)}</div>
+          <div class="atk-sub">${p.internal ? "内网对象" : "公网对象 · " + esc(p.country)} · ${esc(p.type)} · ${esc(basis)}${esc(forwarded)} · 意图 ${esc(p.intent)}</div>
         </div>
         <div class="atk-score">
           <div class="as-num mono" style="color:${c}">${p.score}<span>/100</span></div>
@@ -97,6 +100,7 @@
       <div class="wrap-chips">${evs}</div>
 
       <div class="atk-rec"><b>处置建议</b> ${esc(p.rec)}</div>
+      ${observed ? `<div class="atk-foot mut mono">观测节点 ${esc(observed)}</div>` : ""}
       <div class="atk-foot mut mono">活动 ${esc(p.first.slice(5, 16))} ~ ${esc(p.last.slice(5, 16))}</div>
     </div>`;
   }

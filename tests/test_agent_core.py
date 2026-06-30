@@ -9,7 +9,7 @@ from agent.policy import PolicyGuard
 from agent.rules import CustomRuleStore, propose_rule_from_llm_parse, propose_rule_from_text, rule_matches
 from agent.schemas import ActionPlan, AlertTask, EvidenceBundle, TriageVerdict
 from agent.triage_service import AgentTriageService, apply_policy_preview
-from cfw_alert_monitor import call_router_batch, run_router_agent_triage
+from cfw_alert_monitor import call_router_batch, has_success_source_evidence, run_router_agent_triage
 import triage_stats
 from cfw_alert_center_triage import (
     apply_custom_rules_to_rows,
@@ -58,6 +58,28 @@ class AgentPolicyTests(unittest.TestCase):
         verdict = TriageVerdict("业务误报", "高", "无原始记录")
         decision = self.guard(alert, EvidenceBundle(), verdict)
         self.assertFalse(decision.allows("omit_alert"))
+
+
+class SourceEvidenceTests(unittest.TestCase):
+    def test_es_bulk_created_is_success_evidence(self):
+        row = {
+            "源包证据": {
+                "req": "POST /sup8-code-log-101366039588-2026/_doc/_bulk HTTP/1.1",
+                "resp": "HTTP/1.1 201 Created",
+                "resp_body": '{"items":[{"index":{"status":201,"result":"created"}}]}',
+            }
+        }
+        self.assertTrue(has_success_source_evidence(row))
+
+    def test_plain_http_200_is_not_success_evidence(self):
+        row = {
+            "源包证据": {
+                "req": "POST /login HTTP/1.1",
+                "resp": "HTTP/1.1 200 OK",
+                "resp_body": "<html>ok</html>",
+            }
+        }
+        self.assertFalse(has_success_source_evidence(row))
 
 
 class CustomRuleDraftTests(unittest.TestCase):

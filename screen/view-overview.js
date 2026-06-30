@@ -63,7 +63,7 @@
       <div class="grid g-3 mt">
         <div class="panel span-2">
           <div class="accent-top"></div>
-          <h2 class="flex between"><span>🔴 需重点关注 · 实时</span><span class="hint">高危 / 确认成功 / 需人工</span></h2>
+          <h2 class="flex between"><span>🔴 需重点关注 · 实时</span><span class="hint">确认成功 / 需人工 / 待重试</span></h2>
           <table><thead><tr><th>时间</th><th>等级</th><th>事件</th><th>来源 → 目标</th><th>研判</th></tr></thead>
           <tbody>${CFW.DEMO.attention.map(a => `<tr>
             <td class="mut mono">${esc(a.time.slice(5, 16))}</td>
@@ -118,7 +118,7 @@
 
   function drawDonut(w) {
     const labels = Object.keys(w.results), data = Object.values(w.results);
-    const colorOf = l => l === "确认成功" ? "#ef4444" : l === "需人工复核" ? "#d97706" : l === "扫描探测" ? "#7f8d9f" : l === "未见成功证据" ? "#0065fd" : "#059669";
+    const colorOf = l => l === "确认成功" ? "#ef4444" : l === "需人工复核" ? "#d97706" : l === "转发重复告警" ? "#0f766e" : l === "扫描探测" ? "#7f8d9f" : l === "未见成功证据" ? "#0065fd" : "#059669";
     const colors = labels.map(colorOf);
     if (donutChart) donutChart.destroy();
     donutChart = new Chart(CFW.$("#ovDonut"), {

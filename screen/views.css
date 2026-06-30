@@ -602,6 +602,66 @@
   box-shadow: inset 3px 0 0 color-mix(in srgb, var(--warn) 75%, #ffffff);
 }
 
+.triage-table-wrap {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.triage-table {
+  table-layout: fixed;
+  min-width: 1180px;
+}
+
+.triage-col-time { width: 7%; }
+.triage-col-level { width: 5%; }
+.triage-col-event { width: 17%; }
+.triage-col-source-ip { width: 11%; }
+.triage-col-target { width: 22%; }
+.triage-col-result { width: 8%; }
+.triage-col-source { width: 8%; }
+.triage-col-evidence { width: 16%; }
+.triage-col-token { width: 6%; }
+
+.triage-table th,
+.triage-table td {
+  min-width: 0;
+}
+
+.triage-time,
+.triage-level,
+.triage-result,
+.triage-source,
+.triage-token {
+  white-space: nowrap;
+}
+
+.triage-event,
+.triage-ip,
+.triage-target,
+.triage-evidence {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.triage-target {
+  line-height: 1.45;
+}
+
+.triage-table tr.handled-row td {
+  background: #f8fafc;
+}
+
+.triage-action-msg {
+  margin: 10px 0 0;
+  padding: 9px 11px;
+  border: 1px solid #bfdbfe;
+  border-radius: var(--r-sm);
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 12px;
+}
+
 .triage-detail {
   border-top: 1px solid var(--line);
   border-bottom: 1px solid var(--line);
@@ -643,6 +703,170 @@
   margin-top: 8px;
   overflow-wrap: anywhere;
   line-height: 1.7;
+}
+
+.triage-actions {
+  margin: 10px 0 12px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: #fff;
+}
+
+.triage-action-status {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.triage-action-status.ok {
+  color: var(--ok);
+}
+
+.triage-action-status.warn {
+  color: var(--warn);
+}
+
+.triage-action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.triage-action-buttons .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.triage-action-buttons .btn.danger {
+  border-color: #fecaca;
+  background: #fff1f2;
+  color: #b91c1c;
+}
+
+.triage-action-buttons .btn.danger:hover:not(:disabled) {
+  border-color: #fca5a5;
+  background: #fee2e2;
+}
+
+.triage-action-buttons .btn:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+
+.btn-ic {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+}
+
+.btn-ic svg {
+  width: 14px;
+  height: 14px;
+}
+
+.triage-action-note {
+  margin-top: 7px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.trace-chain {
+  margin: 10px 0 12px;
+  padding: 10px;
+  border: 1px solid #bfdbfe;
+  border-radius: var(--r-sm);
+  background: #eff6ff;
+}
+
+.trace-title,
+.trace-action {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.trace-title b {
+  color: var(--primary);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.trace-path {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: stretch;
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.trace-node {
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid #dbeafe;
+  border-radius: var(--r-sm);
+  background: #fff;
+}
+
+.trace-node span,
+.trace-action span {
+  display: block;
+  color: var(--muted-foreground);
+  font-size: 11px;
+}
+
+.trace-node b {
+  display: block;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  color: var(--foreground);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.trace-node small {
+  display: block;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  color: var(--muted-foreground);
+  font-size: 11px;
+}
+
+.trace-arrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--primary);
+  font-weight: 700;
+}
+
+.trace-pub {
+  border-color: #fecdd3;
+}
+
+.trace-mid {
+  border-color: #fed7aa;
+}
+
+.trace-dst {
+  border-color: #bbf7d0;
+}
+
+.trace-action {
+  flex-wrap: wrap;
+  margin-top: 9px;
+}
+
+.trace-action b {
+  overflow-wrap: anywhere;
+}
+
+.trace-action em {
+  color: var(--muted-foreground);
+  font-style: normal;
+  font-size: 11px;
 }
 
 .evidence-json {
@@ -1751,6 +1975,15 @@
   .agent-preview-kpis,
   .detail-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .trace-path {
+    grid-template-columns: 1fr;
+  }
+
+  .trace-arrow {
+    min-height: 12px;
+    transform: rotate(90deg);
   }
 
   .rule-section-head {

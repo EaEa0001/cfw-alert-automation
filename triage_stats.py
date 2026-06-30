@@ -14,9 +14,11 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "reports"
 LOG_DIR = ROOT / "logs"
+MANUAL_ACTIONS_PATH = DATA_DIR / "manual-actions.jsonl"
 
-RESULT_ORDER = ["确认成功", "需人工复核", "待模型重试", "未见成功证据", "确认未成功", "扫描探测"]
-PROFILE_NO_SUCCESS_RESULTS = {"确认未成功", "未见成功证据", "扫描探测", "业务误报"}
+RESULT_ORDER = ["确认成功", "需人工复核", "待模型重试", "业务误报", "转发重复告警", "未见成功证据", "确认未成功", "扫描探测"]
+AUTO_IGNORE_RESULTS = {"确认未成功", "未见成功证据", "扫描探测", "业务误报", "转发重复告警"}
+PROFILE_NO_SUCCESS_RESULTS = {"确认未成功", "未见成功证据", "扫描探测", "业务误报", "转发重复告警"}
 PROFILE_STAGE_ALIASES = {
     "": "",
     "无": "",
@@ -65,12 +67,59 @@ def source_label(value):
         return SOURCE_LABEL[value]
     if is_retry_pending_source(value):
         return "待模型重试"
+    if value.endswith("_source"):
+        return "源包复核"
+    if value.endswith("_agent"):
+        return "Agent"
+    if value:
+        return "单轮"
     return value or "未知"
+
+
+def active_llm_route(config, stage="batch_triage"):
+    llm = (config or {}).get("llm") or {}
+    providers = llm.get("providers") or {}
+    routes = llm.get("routing") or {}
+    provider_name = str(routes.get(stage) or llm.get("provider") or "").strip()
+    if not provider_name and providers:
+        provider_name = next(iter(providers))
+    provider = providers.get(provider_name) or {}
+    model = str(provider.get("model") or llm.get("model") or "").strip()
+    return {
+        "provider": provider_name,
+        "model": model,
+        "label": " · ".join(part for part in (provider_name, model) if part),
+    }
 
 
 def is_retry_pending_source(value):
     value = str(value or "")
     return value.startswith("retry_pending") or value.startswith("rule_fallback")
+
+
+def is_auto_ignored_row(row):
+    """Mirror the alert-center auto-dispose policy closely enough for UI stats."""
+    result = row.get("模型研判", "")
+    if result not in AUTO_IGNORE_RESULTS:
+        return False
+    if row.get("告警等级") == "高危":
+        if result not in ("确认未成功", "扫描探测", "业务误报", "转发重复告警"):
+            return False
+        if row.get("模型置信度") == "低":
+            return False
+        if result == "业务误报" and not (row.get("关键证据") or row.get("源包证据")):
+            return False
+    return True
+
+
+def requires_manual_attention(row):
+    if row.get("人工已处理") or row.get("人工处理状态") == "handled":
+        return False
+    if is_retry_pending_source(row.get("研判来源", "")) or row.get("模型研判") == "待模型重试":
+        return True
+    if not row.get("模型研判"):
+        return True
+    return not is_auto_ignored_row(row)
 
 
 def profile_stage_label(value, default="探测"):
@@ -110,6 +159,32 @@ def _parse_time(value):
     return None
 
 
+def manual_actions_by_alert():
+    """Latest manual handling action by alert id."""
+    out = {}
+    for row in _read_jsonl(MANUAL_ACTIONS_PATH):
+        alert_id = str(row.get("alert_id") or row.get("告警ID") or "").strip()
+        if not alert_id:
+            continue
+        out[alert_id] = row
+    return out
+
+
+def _attach_manual_action(row, action):
+    status = str(action.get("status") or "")
+    row["人工处理状态"] = status
+    row["人工处理状态文本"] = action.get("status_label") or ("已处理" if status == "handled" else "已撤销" if status == "reopened" else "处理失败")
+    row["人工处理动作"] = action.get("action", "")
+    row["人工处理动作文本"] = action.get("action_label", "")
+    row["人工处理时间"] = action.get("created_at", "")
+    row["人工处理人"] = action.get("operator", "")
+    row["人工处理备注"] = action.get("note", "")
+    row["人工处理目标"] = action.get("target_ip", "")
+    row["人工处理规则ID"] = action.get("rule_id", "")
+    row["人工已处理"] = status == "handled"
+    return row
+
+
 def _to_int(value):
     try:
         return int(value)
@@ -144,6 +219,11 @@ def load_judgements(days):
         prev = by_id.get(aid)
         if not prev or (row.get("_file_dt") and prev.get("_file_dt") and row["_file_dt"] >= prev["_file_dt"]):
             by_id[aid] = row
+    actions = manual_actions_by_alert()
+    for alert_id, row in by_id.items():
+        action = actions.get(str(alert_id))
+        if action:
+            _attach_manual_action(row, action)
     return list(by_id.values())
 
 
@@ -155,9 +235,8 @@ def overview(days=7):
     levels = Counter(r.get("告警等级", "") for r in rows)
     evidence_src = Counter(r.get("证据来源", "") or "无" for r in rows)
 
-    ignore_set = {"确认未成功", "未见成功证据", "扫描探测"}
-    auto_ignored = sum(results.get(k, 0) for k in ignore_set)
-    retained = total - auto_ignored
+    auto_ignored = sum(1 for row in rows if is_auto_ignored_row(row))
+    retained = sum(1 for row in rows if requires_manual_attention(row))
 
     tok_in = sum(_to_int(r.get("输入Token")) for r in rows)
     tok_out = sum(_to_int(r.get("输出Token")) for r in rows)
@@ -177,6 +256,7 @@ def overview(days=7):
         "total": total,
         "auto_ignored": auto_ignored,
         "retained": retained,
+        "manual_required": retained,
         "ignore_rate": round(auto_ignored / total * 100, 1) if total else 0,
         "results": {k: results.get(k, 0) for k in RESULT_ORDER if results.get(k)},
         "sources": dict(sources),
@@ -232,9 +312,26 @@ def alerts(days=7, level=None, result=None, source=None, limit=300):
         row["输出Token"] = _to_int(r.get("输出Token"))
         row["推理Token"] = _to_int(r.get("推理Token"))
         row["Token"] = row["输入Token"] + row["输出Token"] + row["推理Token"]
+        row["自动忽略"] = is_auto_ignored_row(r)
+        row["需人工关注"] = requires_manual_attention(r)
         out.append(row)
     out.sort(key=lambda x: x["告警时间"], reverse=True)
-    return out[:limit]
+    if not limit or len(out) <= limit:
+        return out
+
+    # The triage console may request a bounded recent list, but manual items must
+    # always be present; otherwise the sidebar/manual KPI can say "1" while the
+    # table cannot find it because it fell outside the latest N rows.
+    head = out[:limit]
+    seen = {row.get("告警ID") for row in head if row.get("告警ID")}
+    tail_manual = [
+        row for row in out[limit:]
+        if row.get("告警ID") not in seen and row.get("需人工关注")
+    ]
+    if tail_manual:
+        head.extend(tail_manual)
+        head.sort(key=lambda x: (bool(x.get("需人工关注")), x.get("告警时间", "")), reverse=True)
+    return head
 
 
 import ipaddress as _ipaddress
@@ -334,8 +431,8 @@ def asset_cards(days=7, only_notable=True, limit=40):
                 g["success"] += 1
             if result:
                 g["results"][result] = g["results"].get(result, 0) + 1
-            # 误报 vs 真攻击:业务误报/扫描探测=误报噪声;其余(确认成功/未成功/未见成功/需人工)=真攻击
-            if result in ("业务误报", "扫描探测"):
+            # 误报/转发重复/扫描噪声不作为资产真实受害成功面计算。
+            if result in ("业务误报", "扫描探测", "转发重复告警"):
                 g["fp"] += 1
             elif result:
                 g["real"] += 1
@@ -381,11 +478,11 @@ def asset_cards(days=7, only_notable=True, limit=40):
 
 
 def realtime_attention(days=2, limit=30):
-    """需重点关注的实时列表:确认成功/需人工复核/高危。"""
+    """需重点关注的实时列表:与人工待处理口径一致。"""
     rows = load_judgements(days)
     out = []
     for r in rows:
-        if r.get("模型研判") in ("确认成功", "需人工复核") or r.get("告警等级") == "高危":
+        if requires_manual_attention(r):
             out.append({
                 "time": r.get("告警时间", ""),
                 "level": r.get("告警等级", ""),
@@ -594,16 +691,28 @@ def health(days=7):
             for action in (rec.get("omit_actions") or []) + (rec.get("white_actions") or []):
                 if action.get("error") or action.get("return_code") not in (None, 0, "0"):
                     dispose_failed += 1
+    for path in sorted(glob.glob(str(DATA_DIR / "realtime-poll-*.jsonl"))):
+        for rec in _read_jsonl(path):
+            at = _parse_time(rec.get("recorded_at") or rec.get("query_end"))
+            if not (at and at >= cutoff):
+                continue
+            dispose_ignored += _to_int(rec.get("ignore_event_ids"))
+            dispose_failed += _action_failed_count(rec)
     # 源包命中率 / Agent 占比
     rows = load_judgements(days)
+    auto_ignored_rows = sum(1 for r in rows if is_auto_ignored_row(r))
+    dispose_action_ignored = dispose_ignored
+    dispose_ignored = max(dispose_ignored, auto_ignored_rows)
     with_evidence = sum(1 for r in rows if r.get("证据来源") in ("主动拉取", "本地缓存"))
-    agent_count = sum(1 for r in rows if r.get("研判来源") == "codex_agent")
+    agent_count = sum(1 for r in rows if source_label(r.get("研判来源")) == "Agent")
     retry_pending = sum(1 for r in rows if is_retry_pending_source(r.get("研判来源", "")))
     return {
         "errors_total": sum(err_by_type.values()),
         "errors_by_type": dict(err_by_type),
         "recent_errors": errors[-15:][::-1],
         "dispose_ignored": dispose_ignored,
+        "dispose_action_ignored": dispose_action_ignored,
+        "auto_ignored": auto_ignored_rows,
         "dispose_failed": dispose_failed,
         "evidence_hit_rate": round(with_evidence / len(rows) * 100, 1) if rows else 0,
         "evidence_hit": with_evidence,
@@ -624,6 +733,7 @@ def pipeline_status(days=7, config=None, limit=12):
     wecom_cfg = config.get("wecom") or {}
     agent_cfg = config.get("agent") or {}
     llm_cfg = config.get("llm") or {}
+    active_llm = active_llm_route(config)
 
     rounds = []
     for path in sorted(glob.glob(str(DATA_DIR / "realtime-poll-*.jsonl"))):
@@ -685,7 +795,9 @@ def pipeline_status(days=7, config=None, limit=12):
             "daily_report_enabled": bool(wecom_cfg.get("daily_enabled", True)),
             "manual_push_enabled": bool(wecom_cfg.get("manual_enabled", True)),
             "agent_enabled": bool(agent_cfg.get("enabled", False)),
-            "model": llm_cfg.get("model", ""),
+            "provider": active_llm["provider"],
+            "model": active_llm["model"] or llm_cfg.get("model", ""),
+            "model_label": active_llm["label"],
         },
         "last_round": last_round,
         "active_round": active_round,
@@ -857,28 +969,72 @@ def _country_for_ip(row, ip):
     return ""
 
 
+def _split_ip_field(value):
+    return [x.strip() for x in str(value or "").split("|") if x.strip() and x.strip() not in ("—", "-")]
+
+
+def _first_ip_field(*values):
+    for value in values:
+        ips = _split_ip_field(value)
+        if ips:
+            return ips[0]
+    return ""
+
+
+def _profile_actor_ips(row, src_ips):
+    """Profile the entity that should be handled, not every observed hop."""
+    disposition = _first_ip_field(row.get("处置对象"))
+    root = _first_ip_field(row.get("真实攻击源"))
+    if disposition:
+        return [disposition], "处置对象"
+    if root:
+        return [root], "真实攻击源"
+    return src_ips, "攻击源"
+
+
+def _landed_signal(row, event):
+    text = " ".join(str(row.get(k) or "") for k in ("关键证据", "源包命中", "源包证据", "研判理由", "下一步"))
+    text = f"{event} {text}"
+    return any(k in text for k in ("njRAT", "木马", "webshell", "WebShell", "反弹Shell", "回连成功", "命令回显", "执行结果"))
+
+
+def _scan_like_event(event, result=""):
+    text = f"{event} {result}"
+    return any(k in text for k in ("扫描", "探测", "nmap", "zgrab", "Censys", "paloalto", "扫描器", "扫描工具", "信息泄露"))
+
+
 def _fallback_profiles_from_judgements(days=7, limit=50):
     """Build rule-based attacker cards when attacker_profile.py has not run yet."""
     rows = load_judgements(days)
     agg = {}
     for row in rows:
-        src_ips = [x.strip() for x in str(row.get("攻击IP") or "").split("|") if x.strip()]
-        dst_ips = [x.strip() for x in str(row.get("目标IP") or "").split("|") if x.strip()]
+        src_ips = _split_ip_field(row.get("攻击IP"))
+        dst_ips = _split_ip_field(row.get("目标IP"))
         event = row.get("事件名称", "")
         result = row.get("模型研判", "")
         level = row.get("告警等级", "")
         at = row.get("告警时间", "")
-        for ip in src_ips:
+        actor_ips, actor_basis = _profile_actor_ips(row, src_ips)
+        observed = _split_ip_field(row.get("观测源"))
+        if not observed and actor_basis in ("处置对象", "真实攻击源"):
+            observed = src_ips
+        for ip in dict.fromkeys(actor_ips):
             g = agg.setdefault(ip, {
                 "ip": ip,
                 "internal": not _is_public(ip),
                 "country": _country_for_ip(row, ip),
+                "actor_basis": actor_basis,
                 "alert_count": 0,
                 "events": Counter(),
                 "targets": set(),
+                "source_ips": set(),
+                "observed_sources": set(),
                 "results": Counter(),
                 "high": 0,
                 "cloud_success": 0,
+                "landed": 0,
+                "forwarded": 0,
+                "scan_like": 0,
                 "first_seen": at,
                 "last_seen": at,
                 "max_danger": 0,
@@ -886,6 +1042,14 @@ def _fallback_profiles_from_judgements(days=7, limit=50):
             if not g["country"]:
                 g["country"] = _country_for_ip(row, ip)
             g["alert_count"] += 1
+            if actor_basis in ("处置对象", "真实攻击源"):
+                for src in src_ips:
+                    g["source_ips"].add(src)
+            else:
+                g["source_ips"].add(ip)
+            for obs in observed:
+                if obs and obs != ip:
+                    g["observed_sources"].add(obs)
             if event:
                 g["events"][event] += 1
                 g["max_danger"] = max(g["max_danger"], _danger_level(event))
@@ -897,6 +1061,12 @@ def _fallback_profiles_from_judgements(days=7, limit=50):
                 g["high"] += 1
             if result == "确认成功":
                 g["cloud_success"] += 1
+            if result == "转发重复告警":
+                g["forwarded"] += 1
+            if _scan_like_event(event, result):
+                g["scan_like"] += 1
+            if result not in PROFILE_NO_SUCCESS_RESULTS and _landed_signal(row, event):
+                g["landed"] += 1
             if at and (not g["first_seen"] or at < g["first_seen"]):
                 g["first_seen"] = at
             if at and at > g["last_seen"]:
@@ -908,62 +1078,96 @@ def _fallback_profiles_from_judgements(days=7, limit=50):
         target_count = len(g["targets"])
         success = g["cloud_success"]
         manual = g["results"].get("需人工复核", 0)
+        retry = g["results"].get("待模型重试", 0)
         unknown = g["results"].get("未见成功证据", 0)
         scan = g["results"].get("扫描探测", 0)
+        scan_like = max(scan, g["scan_like"])
         false_positive = g["results"].get("业务误报", 0)
+        forwarded = g["forwarded"]
+        landed = g["landed"]
         safe_count = sum(g["results"].get(k, 0) for k in PROFILE_NO_SUCCESS_RESULTS)
         all_no_success = (
             success == 0
             and manual == 0
-            and g["high"] == 0
+            and retry == 0
+            and landed == 0
             and g["alert_count"] > 0
             and safe_count >= g["alert_count"]
         )
-        base_score = (
-            10
-            + min(g["alert_count"] * 2, 18)
-            + min(technique_kinds * 5, 35)
-            + min(target_count * 4, 20)
-        )
-        risk_bonus = g["high"] * 16 + success * 35 + manual * 14
+        effective_success = success > 0 or landed > 0
+        activity_score = min(g["alert_count"] * 2, 18) + min(technique_kinds * 4, 24) + min(target_count * 3, 15)
+        score = 12 + activity_score
+        if effective_success:
+            score += 45 + min(g["high"] * 8, 24) + min(g["max_danger"] * 6, 12)
+        elif manual or retry:
+            score += 16 + min(g["max_danger"] * 6, 12) + min(g["high"] * 4, 12)
+        elif not all_no_success:
+            score += min(g["max_danger"] * 5, 10) + min(g["high"] * 3, 9)
+        elif unknown or g["results"].get("确认未成功", 0):
+            score += min(g["max_danger"] * 3, 6)
+        score = min(100, score)
         if all_no_success:
-            if unknown or g["results"].get("确认未成功", 0):
-                risk_bonus += min(g["max_danger"] * 4, 8)
-        else:
-            risk_bonus += g["max_danger"] * 8
-        score = min(100, base_score + risk_bonus)
-        if all_no_success:
-            if scan + false_positive >= max(1, g["alert_count"] // 2):
+            if forwarded >= max(1, g["alert_count"] // 2):
+                score = min(score, 32)
+            elif false_positive >= max(1, g["alert_count"] // 2):
+                score = min(score, 28)
+            elif scan_like >= max(1, g["alert_count"] // 2):
                 score = min(score, 34)
             elif g["max_danger"] >= 2 or technique_kinds >= 4 or g["alert_count"] >= 5:
                 score = min(score, 45)
             else:
                 score = min(score, 39)
-        if success or (not all_no_success and score >= 70):
+        elif not effective_success:
+            score = min(score, 69)
+        if effective_success and score >= 70:
             band = "高危"
-        elif manual or unknown or score >= 40:
+        elif manual or retry or unknown or score >= 40:
             band = "关注"
         else:
             band = "一般"
-        if success:
+        if effective_success:
             attacker_type = "疑似成功攻击源"
             intent = "利用并落地"
             stage = "成功利用"
             killchain_stage = "成功利用"
             recommendation = "立即核查目标资产日志和落地痕迹"
+        elif forwarded >= max(1, g["alert_count"] // 2):
+            attacker_type = "转发重复源" if g["actor_basis"] != "攻击源" else "转发/代理节点"
+            intent = "经中间节点触发重复告警"
+            stage = "探测"
+            killchain_stage = "探测"
+            recommendation = "按处置对象处理,不封禁观测节点"
+        elif false_positive >= max(1, g["alert_count"] // 2):
+            attacker_type = "业务误报源"
+            intent = "业务流量触发规则"
+            stage = "探测"
+            killchain_stage = "探测"
+            recommendation = "保持忽略,必要时沉淀白名单规则"
+        elif scan_like >= max(1, g["alert_count"] // 2):
+            attacker_type = "扫描探测源"
+            intent = "资产探测与漏洞枚举"
+            stage = "探测"
+            killchain_stage = "探测"
+            recommendation = "保持自动忽略,如命中受控扫描源可加入规则"
         elif all_no_success and (g["max_danger"] >= 2 or unknown):
             attacker_type = "漏洞利用尝试源"
             intent = "尝试利用暴露服务,未见落地证据"
             stage = "尝试利用"
             killchain_stage = "尝试利用"
             recommendation = "持续观察并保留证据,无成功证据时不按高危攻击者处置"
-        elif g["max_danger"] >= 2 or manual:
-            attacker_type = "漏洞利用攻击源"
-            intent = "尝试利用暴露服务"
+        elif manual or retry:
+            attacker_type = "待人工确认攻击源"
+            intent = "存在不确定告警需复核"
             stage = "尝试利用"
             killchain_stage = "尝试利用"
             recommendation = "优先复核源包、目标服务日志和同源历史行为"
-        elif scan >= max(1, g["alert_count"] // 2):
+        elif g["max_danger"] >= 2:
+            attacker_type = "漏洞利用尝试源"
+            intent = "尝试利用暴露服务,未见落地证据"
+            stage = "尝试利用"
+            killchain_stage = "尝试利用"
+            recommendation = "持续观察,出现成功证据时升级处理"
+        elif scan_like >= max(1, g["alert_count"] // 2):
             attacker_type = "扫描探测源"
             intent = "资产探测与漏洞枚举"
             stage = "探测"
@@ -976,7 +1180,10 @@ def _fallback_profiles_from_judgements(days=7, limit=50):
             killchain_stage = "尝试利用"
             recommendation = "持续观察,出现高危或成功证据时升级处理"
         top_event = g["events"].most_common(1)[0][0] if g["events"] else "未知事件"
-        narrative = f"{g['ip']} 在窗口内触发 {g['alert_count']} 条告警,主要为 {top_event},覆盖 {target_count} 个目标,当前结论以 {g['results'].most_common(1)[0][0] if g['results'] else '未知'} 为主。"
+        top_result = g["results"].most_common(1)[0][0] if g["results"] else "未知"
+        basis = "处置对象" if g["actor_basis"] in ("处置对象", "真实攻击源") else "攻击源"
+        observed_note = f",观测节点 {','.join(sorted(g['observed_sources'])[:3])}" if g["observed_sources"] else ""
+        narrative = f"{g['ip']} 按{basis}聚合 {g['alert_count']} 条告警,主要为 {top_event},覆盖 {target_count} 个目标,当前以 {top_result} 为主{observed_note}。"
         first = _parse_time(g["first_seen"])
         last = _parse_time(g["last_seen"])
         span = round((last - first).total_seconds() / 3600, 1) if first and last and last >= first else 0
@@ -984,6 +1191,12 @@ def _fallback_profiles_from_judgements(days=7, limit=50):
             "ip": g["ip"],
             "internal": g["internal"],
             "country": g["country"],
+            "profile_role": attacker_type,
+            "actor_basis": g["actor_basis"],
+            "observed_sources": sorted(g["observed_sources"]),
+            "source_ips": sorted(g["source_ips"]),
+            "forwarded_count": forwarded,
+            "safe_count": safe_count,
             "attacker_type": attacker_type,
             "intent": intent,
             "stage": stage,

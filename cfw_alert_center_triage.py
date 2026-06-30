@@ -31,7 +31,7 @@ ATTACK_RESULT_MAP = {
     "2": "攻击失败",
     "3": "尝试/探测",
 }
-IGNORE_RESULTS = {"确认未成功", "未见成功证据", "扫描探测", "业务误报"}
+IGNORE_RESULTS = {"确认未成功", "未见成功证据", "扫描探测", "业务误报", "转发重复告警"}
 SAFE_SCAN_KEYWORDS = (
     "扫描",
     "探测",
@@ -736,36 +736,8 @@ def deep_triage_records(config, records, labels):
     model = (config.get("llm") or {}).get("model", "gpt-5.5")
     rows = [record_to_judge_row(record, labels, config) for record in records]
 
-    # 业务误报记忆短路:命中"同接口+同规则历史一贯业务误报"的,直接定业务误报,
-    # 不进 LLM(省 token)。高危不短路(即便命中也让模型复核,安全优先)。
     by_event = {}
-    llm_rows = []
-    mem_hit = 0
-    try:
-        import triage_memory
-    except Exception:
-        triage_memory = None
-    for row in rows:
-        if triage_memory and row.get("告警等级") != "高危":
-            req = triage_memory._extract_req(row)
-            verdict = triage_memory.biz_fp_verdict(row.get("规则ID", ""), req) if req else None
-            if verdict:
-                by_event[row["告警ID"]] = {
-                    "告警ID": row["告警ID"], "攻击IP": row.get("攻击IP", ""),
-                    "模型研判": "业务误报", "模型置信度": "高",
-                    "研判理由": "记忆短路:该接口+规则近90天%d/%d次均判业务误报"
-                                % (verdict["times"], verdict["total"]),
-                    "关键证据": verdict["path"], "下一步": "自动忽略",
-                    "研判来源": "memory_biz_fp", "研判模型": "memory",
-                    "输入Token": "0", "输出Token": "0", "推理Token": "0",
-                }
-                mem_hit += 1
-                continue
-        llm_rows.append(row)
-
-    if mem_hit:
-        print(json.dumps({"biz_fp_memory_shortcut": mem_hit,
-                          "sent_to_llm": len(llm_rows)}, ensure_ascii=False))
+    llm_rows = rows
 
     judgements = monitor.llm_judge_rows(config, llm_rows)
     for row in llm_rows:
@@ -784,20 +756,6 @@ def deep_triage_records(config, records, labels):
             item.setdefault("攻击IP", row.get("攻击IP") or "")
             item.setdefault("目标IP", row.get("目标IP") or "")
 
-    # 写回业务误报内容记忆:本轮判为业务误报的(无论来自模型还是短路),沉淀指纹
-    if triage_memory:
-        for row in rows:
-            item = by_event.get(row["告警ID"])
-            if item and item.get("模型研判") == "业务误报" \
-                    and item.get("研判来源") != "memory_biz_fp":
-                req = triage_memory._extract_req(row)
-                if req:
-                    try:
-                        triage_memory.remember_biz_fp(
-                            row.get("规则ID", ""), req, "业务误报",
-                            asset=row.get("目标资产", ""))
-                    except Exception:
-                        pass
     return by_event
 
 
@@ -1147,6 +1105,66 @@ def safe_hourly_dispose(config, start, end, dry_run=False):
     return result
 
 
+def _parse_report_time(value):
+    for fmt, width in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d %H:%M", 16), ("%Y-%m-%d", 10)):
+        try:
+            return datetime.strptime(str(value or "")[:width], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def load_historical_judgement_rows(days=0, limit=0):
+    """Read historical judged alert rows from report jsonl files, latest row wins per alert id."""
+    cutoff = None
+    if days and int(days) > 0:
+        cutoff = monitor.now_local() - timedelta(days=int(days))
+    by_id = {}
+    for path in sorted(REPORT_DIR.glob("cfw_alert_center_judgement_*.jsonl")):
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            alert_id = str(row.get("告警ID") or "").strip()
+            if not alert_id:
+                continue
+            at = _parse_report_time(row.get("告警时间"))
+            if cutoff and at and at < cutoff:
+                continue
+            row["_report_file"] = path.name
+            by_id[alert_id] = row
+    rows = list(by_id.values())
+    rows.sort(key=lambda row: str(row.get("告警时间") or ""))
+    if limit and int(limit) > 0:
+        rows = rows[-int(limit):]
+    for row in rows:
+        row.pop("_report_file", None)
+    return rows
+
+
+def backfill_wecom_smartsheet(config, days=0, limit=0, dry_run=False):
+    rows = load_historical_judgement_rows(days=days, limit=limit)
+    result = {
+        "mode": "smartsheet_backfill",
+        "dry_run": bool(dry_run),
+        "days": int(days or 0),
+        "limit": int(limit or 0),
+        "unique_alerts": len(rows),
+    }
+    if dry_run:
+        result["push"] = {"sent": False, "reason": "dry_run"}
+        return result
+    result["push"] = monitor.push_wecom_smartsheet_alerts(config, rows, source="history_backfill")
+    return result
+
+
 def whitelist_labels(config):
     labels = {}
     for ip in config.get("tencent_scan_ips", []):
@@ -1219,6 +1237,11 @@ def deterministic_white_judgement(row, model):
 
 
 def apply_judgements(rows, judgements):
+    judgement_fields = (
+        "模型研判", "模型置信度", "研判理由", "关键证据", "下一步", "研判来源", "研判模型",
+        "工具轨迹", "真实攻击源", "观测源", "中间节点", "处置对象", "链路类型",
+        "输入Token", "输出Token", "推理Token",
+    )
     out = []
     for row in rows:
         item = judgements.get(row["告警ID"]) or {}
@@ -1226,7 +1249,7 @@ def apply_judgements(rows, judgements):
         # 源包证据是 dict,序列化成紧凑文本方便落 CSV
         if isinstance(merged.get("源包证据"), dict):
             merged["源包证据"] = json.dumps(merged["源包证据"], ensure_ascii=False, separators=(",", ":"))
-        for key in ("模型研判", "模型置信度", "研判理由", "关键证据", "下一步", "研判来源", "研判模型", "工具轨迹", "输入Token", "输出Token", "推理Token"):
+        for key in judgement_fields:
             merged[key] = item.get(key, "")
         out.append(merged)
     return out
@@ -1557,6 +1580,12 @@ def realtime_triage_once(config, dry_run=False):
     jsonl_path = REPORT_DIR / f"cfw_alert_center_judgement_{stamp}.jsonl"
     dispose_path = REPORT_DIR / f"cfw_realtime_disposition_{stamp}.json"
     write_jsonl(jsonl_path, judged_rows)
+    smartsheet_push = {"sent": False, "reason": "dry_run" if dry_run else "skipped"}
+    if not dry_run:
+        try:
+            smartsheet_push = monitor.push_wecom_smartsheet_alerts(config, judged_rows, source="realtime")
+        except Exception as exc:
+            smartsheet_push = {"sent": False, "error": str(exc)[:200]}
 
     if not dry_run:
         by_id = {row.get("告警ID"): row for row in judged_rows}
@@ -1590,6 +1619,7 @@ def realtime_triage_once(config, dry_run=False):
         "manual_candidates": len(manual_rows),
         "manual_pending_push": len(pending_manual_rows),
         "manual_push": manual_push,
+        "smartsheet_push": smartsheet_push,
         "retry_queue_enqueued": retry_queue_enqueued,
         "retry_queue_resolved": retry_queue_resolved,
         "white_actions": white_actions,
@@ -1651,6 +1681,12 @@ def main():
     parser.add_argument("--reset-realtime-state", action="store_true")
     parser.add_argument("--recover", action="store_true",
                         help="AI 重新接入后,对待模型重试队列复判(轻量,可频繁调度)")
+    parser.add_argument("--smartsheet-backfill", action="store_true",
+                        help="把历史 reports/cfw_alert_center_judgement_*.jsonl 去重回填到企业微信智能表格")
+    parser.add_argument("--smartsheet-days", type=int, default=0,
+                        help="回填最近 N 天历史告警,0 表示全部历史")
+    parser.add_argument("--smartsheet-limit", type=int, default=0,
+                        help="回填最近 N 条去重告警,0 表示不限")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--limit", type=int)
     args = parser.parse_args()
@@ -1669,6 +1705,17 @@ def main():
             pass
     if args.recover:
         print(json.dumps(recover_degraded_queue(config, args.dry_run), ensure_ascii=False))
+        return
+    if args.smartsheet_backfill:
+        print(json.dumps(
+            backfill_wecom_smartsheet(
+                config,
+                days=args.smartsheet_days,
+                limit=args.smartsheet_limit,
+                dry_run=args.dry_run,
+            ),
+            ensure_ascii=False,
+        ))
         return
     if args.realtime_once:
         print(json.dumps(realtime_triage_once(config, args.dry_run), ensure_ascii=False))
@@ -1718,53 +1765,8 @@ def main():
     judgements = {row["告警ID"]: deterministic_white_judgement(row, model) for row in white_rows}
     judgements.update(custom_judgements)
 
-    # 业务误报记忆短路(与 deep_triage_records 同口径):命中即定业务误报,跳过 LLM。
-    try:
-        import triage_memory
-    except Exception:
-        triage_memory = None
-    if triage_memory:
-        remaining = []
-        biz_hit = 0
-        for row in llm_rows:
-            if row.get("告警等级") != "高危":
-                req = triage_memory._extract_req(row)
-                verdict = triage_memory.biz_fp_verdict(row.get("规则ID", ""), req) if req else None
-                if verdict:
-                    judgements[row["告警ID"]] = {
-                        "告警ID": row["告警ID"], "攻击IP": row.get("攻击IP", ""),
-                        "模型研判": "业务误报", "模型置信度": "高",
-                        "研判理由": "记忆短路:该接口+规则近90天%d/%d次均判业务误报"
-                                    % (verdict["times"], verdict["total"]),
-                        "关键证据": verdict["path"], "下一步": "自动忽略",
-                        "研判来源": "memory_biz_fp", "研判模型": "memory",
-                        "输入Token": "0", "输出Token": "0", "推理Token": "0",
-                    }
-                    biz_hit += 1
-                    continue
-            remaining.append(row)
-        if biz_hit:
-            print(json.dumps({"biz_fp_memory_shortcut": biz_hit,
-                              "sent_to_llm": len(remaining)}, ensure_ascii=False))
-        llm_rows = remaining
-
     judgements.update(monitor.llm_judge_rows(config, llm_rows))
     attach_policy_fields(judgements, rows)
-
-    # 写回业务误报内容记忆(本轮模型判为业务误报的)
-    if triage_memory:
-        for row in rows:
-            item = judgements.get(row["告警ID"])
-            if item and item.get("模型研判") == "业务误报" \
-                    and item.get("研判来源") != "memory_biz_fp":
-                req = triage_memory._extract_req(row)
-                if req:
-                    try:
-                        triage_memory.remember_biz_fp(
-                            row.get("规则ID", ""), req, "业务误报",
-                            asset=row.get("目标资产", ""))
-                    except Exception:
-                        pass
 
     judged_rows = apply_judgements(rows, judgements)
     ignore_ids = [row["告警ID"] for row in judged_rows if can_ignore_judged_row(row, records, judgements)]
@@ -1818,12 +1820,23 @@ def main():
         "研判来源",
         "研判模型",
         "工具轨迹",
+        "真实攻击源",
+        "观测源",
+        "中间节点",
+        "处置对象",
+        "链路类型",
         "输入Token",
         "输出Token",
         "推理Token",
     ]
     monitor.write_csv(csv_path, fieldnames, judged_rows)
     write_jsonl(jsonl_path, judged_rows)
+    smartsheet_push = {"sent": False, "reason": "dry_run" if args.dry_run else "skipped"}
+    if not args.dry_run:
+        try:
+            smartsheet_push = monitor.push_wecom_smartsheet_alerts(config, judged_rows, source="alert_center_triage")
+        except Exception as exc:
+            smartsheet_push = {"sent": False, "error": str(exc)[:200]}
 
     white_actions = []
     omit_actions = []
@@ -1857,6 +1870,7 @@ def main():
         "white_actions": white_actions,
         "omit_actions": omit_actions,
         "manual_push": manual_push,
+        "smartsheet_push": smartsheet_push,
         "judgement_csv": str(csv_path),
         "judgement_jsonl": str(jsonl_path),
     }

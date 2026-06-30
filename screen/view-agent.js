@@ -253,7 +253,7 @@
         ${tccli.map(item => `<span class="profile-chip ${item.ready ? "ready" : ""}">${esc(item.name)} · ${item.ready ? "可用" : (item.exists ? "文件存在但未识别" : "无文件")}</span>`).join("")}
       </div>
       <div class="flex between mt-sm">
-        <span class="hint">保存 AK/SK 后,告警拉取、源包取证、腾讯云封禁都会走这组凭证。</span>
+        <span class="hint">保存 AK/SK 后,告警拉取和源包取证会走这组凭证；封禁只登记人工对象，不自动调用腾讯云。</span>
         <button class="btn primary" id="saveTencentAuthBtn">保存腾讯云鉴权</button>
       </div>
     </div>`;

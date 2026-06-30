@@ -15,7 +15,7 @@ import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tencentcloud.common import credential
@@ -40,11 +40,12 @@ CODEX_AUTH_PATH = Path.home() / ".codex" / "auth.json"
 # 研判结果类别:
 #   业务误报   = 内网业务/正常调用被规则误命中(非攻击,忽略)
 #   扫描探测   = 外部扫描器探测(非定向,忽略)
+#   转发重复告警 = 外部扫描/攻击经网关/节点转发后产生的内网二跳重复告警(忽略当前重复事件)
 #   确认未成功 = 真攻击但明确被拦/失败(忽略,源可入封禁清单)
 #   未见成功证据 = 真有攻击行为但未见得手(忽略,源可入封禁清单)
 #   确认成功 / 需人工复核 = 保留人工
-DIRECT_RESULTS = {"确认成功", "确认未成功", "未见成功证据", "扫描探测", "业务误报", "需人工复核"}
-DEFAULT_AUTO_IGNORE_RESULTS = {"确认未成功", "未见成功证据", "扫描探测", "业务误报"}
+DIRECT_RESULTS = {"确认成功", "确认未成功", "未见成功证据", "扫描探测", "业务误报", "转发重复告警", "需人工复核"}
+DEFAULT_AUTO_IGNORE_RESULTS = {"确认未成功", "未见成功证据", "扫描探测", "业务误报", "转发重复告警"}
 CONFIDENCE_MAP = {
     "high": "高",
     "medium": "中",
@@ -176,6 +177,21 @@ def push_manual_review_wecom(config, items, title="需人工研判告警"):
     if not items:
         return {"sent": False, "reason": "no_items"}
     limit = int(notify_cfg.get("manual_max_items", 10))
+    content = build_manual_review_wecom_markdown(items, title=title, limit=limit)
+    webhook = notify_cfg.get("manual_webhook_url") or None
+    # markdown 卡片(带格式)+ text @所有人(markdown 不支持 @,故补一条 text)
+    card = send_wecom_markdown(config, content, "manual_review", webhook_override=webhook)
+    at_result = {"sent": False, "reason": "disabled"}
+    if notify_cfg.get("manual_at_all", True):
+        high = sum(1 for it in items if it.get("告警等级") == "高危")
+        at_text = f"⚠️ 有 {len(items)} 条告警需人工研判（高危 {high}），请及时处理。详情见上方卡片。"
+        at_result = send_wecom_text(config, at_text, "manual_review_at",
+                                    webhook_override=webhook, mentioned_list=["@all"])
+    return {"sent": card.get("sent"), "card": card, "at_all": at_result}
+
+
+def build_manual_review_wecom_markdown(items, title="需人工研判告警", limit=10):
+    """Build the group-webhook card from judged alert fields."""
     lines = [f"## 🔔 {title}（{len(items)} 条需处理）", ""]
     for it in items[:limit]:
         t = str(it.get("告警时间", ""))[5:16]
@@ -188,16 +204,362 @@ def push_manual_review_wecom(config, items, title="需人工研判告警"):
         lines.append("")
     if len(items) > limit:
         lines.append(f"> ……另有 {len(items) - limit} 条，见控制台")
-    webhook = notify_cfg.get("manual_webhook_url") or None
-    # markdown 卡片(带格式)+ text @所有人(markdown 不支持 @,故补一条 text)
-    card = send_wecom_markdown(config, "\n".join(lines).strip(), "manual_review", webhook_override=webhook)
-    at_result = {"sent": False, "reason": "disabled"}
-    if notify_cfg.get("manual_at_all", True):
-        high = sum(1 for it in items if it.get("告警等级") == "高危")
-        at_text = f"⚠️ 有 {len(items)} 条告警需人工研判（高危 {high}），请及时处理。详情见上方卡片。"
-        at_result = send_wecom_text(config, at_text, "manual_review_at",
-                                    webhook_override=webhook, mentioned_list=["@all"])
-    return {"sent": card.get("sent"), "card": card, "at_all": at_result}
+    return "\n".join(lines).strip()
+
+
+SMARTSHEET_FIELD_TITLES = [
+    "告警时间",
+    "告警ID",
+    "等级",
+    "事件名称",
+    "攻击源",
+    "观测源",
+    "目标",
+    "目标资产",
+    "研判结果",
+    "模型研判",
+    "研判理由",
+    "置信度",
+    "是否需人工",
+    "证据来源",
+    "关键证据",
+    "处置建议",
+    "处置对象",
+    "研判来源",
+    "工具轨迹",
+    "链路类型",
+    "Token",
+    "写入时间",
+    "原始详情",
+]
+SMARTSHEET_SELECT_FIELDS = {"等级", "研判结果", "置信度", "研判来源", "链路类型"}
+SMARTSHEET_DATE_FIELDS = {"告警时间", "写入时间"}
+SMARTSHEET_NUMBER_FIELDS = {"Token"}
+SMARTSHEET_BOOL_FIELDS = {"是否需人工"}
+
+
+def _wecom_smartsheet_config(config):
+    cfg = dict((wecom_config(config).get("smartsheet") or {}))
+    cfg.setdefault("enabled", False)
+    cfg.setdefault("batch_size", 100)
+    cfg.setdefault("timeout_seconds", wecom_config(config).get("timeout_seconds", 15))
+    cfg.setdefault("dedupe", True)
+    cfg.setdefault("state_file", "data/wecom-smartsheet-state.json")
+    return cfg
+
+
+def _smartsheet_field_ids(cfg):
+    out = {}
+    schema = cfg.get("schema") or {}
+    schema = schema.get("schema") if isinstance(schema, dict) and "schema" in schema else schema
+    if isinstance(schema, dict):
+        for field_id, meta in schema.items():
+            if isinstance(meta, dict) and meta.get("title"):
+                out[str(meta.get("title"))] = str(field_id)
+    for title, field_id in (cfg.get("field_ids") or {}).items():
+        if field_id:
+            out[str(title)] = str(field_id)
+    return out
+
+
+def _smartsheet_field_types(cfg):
+    out = {}
+    schema = cfg.get("schema") or {}
+    schema = schema.get("schema") if isinstance(schema, dict) and "schema" in schema else schema
+    if isinstance(schema, dict):
+        for meta in schema.values():
+            if isinstance(meta, dict) and meta.get("title") and meta.get("type"):
+                out[str(meta.get("title"))] = str(meta.get("type")).lower()
+    for title, typ in (cfg.get("field_types") or {}).items():
+        if typ:
+            out[str(title)] = str(typ).lower()
+    return out
+
+
+def _smartsheet_state_path(cfg):
+    value = str(cfg.get("state_file") or "data/wecom-smartsheet-state.json")
+    path = Path(value)
+    if not path.is_absolute():
+        path = ROOT / path
+    return path
+
+
+def _read_smartsheet_state(cfg):
+    path = _smartsheet_state_path(cfg)
+    if not path.exists():
+        return {"pushed": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            data.setdefault("pushed", {})
+            return data
+    except Exception:
+        pass
+    return {"pushed": {}}
+
+
+def _write_smartsheet_state(cfg, state):
+    path = _smartsheet_state_path(cfg)
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _parse_local_datetime(value):
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "").strip()
+    for fmt, width in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d %H:%M", 16), ("%Y-%m-%d", 10)):
+        try:
+            return datetime.strptime(text[:width], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _smartsheet_ms(value):
+    dt = _parse_local_datetime(value) or now_local()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone(timedelta(hours=8)))
+    return str(int(dt.timestamp() * 1000))
+
+
+def _smartsheet_clip(value, limit=900):
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit - 1] + "…"
+
+
+def _smartsheet_source_label(value):
+    value = str(value or "")
+    if value == "rule_whitelist":
+        return "白名单规则"
+    if value.startswith("retry_pending") or value.startswith("rule_fallback"):
+        return "待模型重试"
+    if value.endswith("_source"):
+        return "源包复核"
+    if value.endswith("_agent") or value == "codex_agent":
+        return "Agent"
+    if value:
+        return "单轮"
+    return ""
+
+
+def _smartsheet_first_ip(*values):
+    for value in values:
+        parts = [x.strip() for x in str(value or "").split("|") if x.strip()]
+        if parts:
+            return parts[0]
+    return ""
+
+
+def _smartsheet_manual_required(row):
+    if "需人工关注" in row:
+        return bool(row.get("需人工关注"))
+    result = row.get("模型研判", "")
+    return not result or result in {"确认成功", "需人工复核", "待模型重试"}
+
+
+def _smartsheet_row_values(row):
+    result = str(row.get("模型研判") or "")
+    attack_source = row.get("攻击IP") or ""
+    if result == "转发重复告警":
+        attack_source = row.get("真实攻击源") or row.get("处置对象") or attack_source
+    attack_source_value = _smartsheet_first_ip(attack_source) or str(attack_source or "")
+    disposition_target = row.get("处置对象") or (row.get("真实攻击源") if result == "转发重复告警" else "")
+    if not disposition_target:
+        disposition_target = _smartsheet_first_ip(attack_source)
+    token_total = 0
+    for key in ("Token", "token", "输入Token", "输出Token", "推理Token"):
+        try:
+            token_total += int(row.get(key) or 0)
+        except (TypeError, ValueError):
+            pass
+    raw_detail = {
+        "告警ID": row.get("告警ID", ""),
+        "方向": row.get("方向", ""),
+        "威胁类型": row.get("威胁类型", ""),
+        "来源国家": row.get("来源国家", ""),
+        "规则ID": row.get("规则ID", ""),
+        "策略": row.get("策略", ""),
+        "研判理由": row.get("研判理由", ""),
+        "源包命中": row.get("源包命中", ""),
+        "白名单状态": row.get("白名单状态", ""),
+        "真实攻击源": row.get("真实攻击源", ""),
+        "中间节点": row.get("中间节点", ""),
+    }
+    return {
+        "告警时间": row.get("告警时间") or row.get("时间") or "",
+        "告警ID": row.get("告警ID") or "",
+        "等级": row.get("告警等级") or row.get("等级") or "",
+        "事件名称": row.get("事件名称") or row.get("事件") or "",
+        "攻击源": attack_source_value,
+        "观测源": _smartsheet_first_ip(row.get("观测源")) or (_smartsheet_first_ip(row.get("攻击IP")) if result == "转发重复告警" else ""),
+        "目标": row.get("目标IP") or row.get("目标") or "",
+        "目标资产": row.get("目标资产") or "",
+        "研判结果": result,
+        "模型研判": result,
+        "研判理由": _smartsheet_clip(row.get("研判理由") or "", 500),
+        "置信度": row.get("模型置信度") or row.get("置信度") or "",
+        "是否需人工": _smartsheet_manual_required(row),
+        "证据来源": row.get("证据来源") or "",
+        "关键证据": _smartsheet_clip(row.get("关键证据") or row.get("源包命中") or "", 500),
+        "处置建议": _smartsheet_clip(row.get("下一步") or row.get("本地建议") or row.get("云防火墙建议") or "", 300),
+        "处置对象": disposition_target,
+        "研判来源": _smartsheet_source_label(row.get("研判来源", "")),
+        "工具轨迹": _smartsheet_clip(row.get("工具轨迹") or "", 300),
+        "链路类型": row.get("链路类型") or "",
+        "Token": token_total,
+        "写入时间": dt_text(now_local()),
+        "原始详情": _smartsheet_clip(json.dumps(raw_detail, ensure_ascii=False, separators=(",", ":")), 1200),
+    }
+
+
+def _smartsheet_cell_value(title, value, field_type=""):
+    if title == "是否需人工":
+        if not bool(value):
+            return None
+        normalized_type = str(field_type or "").lower()
+        if normalized_type in {"checkbox", "bool", "boolean"}:
+            return True
+        if normalized_type in {"single_select", "select", "multi_select"}:
+            return [{"text": "是"}]
+        return "是"
+    field_type = str(field_type or "").lower()
+    if title in SMARTSHEET_DATE_FIELDS or field_type in {"date_time", "datetime", "date"}:
+        return _smartsheet_ms(value)
+    if title in SMARTSHEET_SELECT_FIELDS or field_type in {"single_select", "select", "multi_select"}:
+        text = str(value or "").strip()
+        return [{"text": text}] if text else None
+    if title in SMARTSHEET_NUMBER_FIELDS or field_type in {"number", "currency", "percentage", "progress"}:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            try:
+                return float(value or 0)
+            except (TypeError, ValueError):
+                return 0
+    if title in SMARTSHEET_BOOL_FIELDS or field_type in {"checkbox", "bool", "boolean"}:
+        return bool(value)
+    return str(value or "")
+
+
+def _smartsheet_record(row, field_ids, field_types=None):
+    field_types = field_types or {}
+    values_by_title = _smartsheet_row_values(row)
+    values = {}
+    for title in SMARTSHEET_FIELD_TITLES:
+        field_id = field_ids.get(title)
+        if not field_id:
+            continue
+        value = _smartsheet_cell_value(title, values_by_title.get(title), field_types.get(title, ""))
+        if value is None:
+            continue
+        values[field_id] = value
+    return {"values": values}
+
+
+def push_wecom_smartsheet_alerts(config, rows, source="triage"):
+    """Append judged alerts into a WeCom Smart Sheet webhook.
+
+    This uses the worksheet-specific webhook payload format, not wecom-cli.
+    Missing/invalid config returns a structured result and never raises.
+    """
+    cfg = _wecom_smartsheet_config(config)
+    result = {
+        "enabled": bool(cfg.get("enabled")),
+        "source": source,
+        "sent": False,
+        "records": 0,
+        "skipped": 0,
+    }
+    if not cfg.get("enabled"):
+        result["reason"] = "disabled"
+        return result
+    webhook_url = str(cfg.get("webhook_url") or "").strip()
+    if not webhook_url:
+        result["reason"] = "missing_webhook_url"
+        return result
+    field_ids = _smartsheet_field_ids(cfg)
+    field_types = _smartsheet_field_types(cfg)
+    required = list(cfg.get("required_fields") or ("告警时间", "告警ID", "研判结果"))
+    missing = [title for title in required if not field_ids.get(title)]
+    if missing:
+        result["reason"] = "missing_field_ids"
+        result["missing_fields"] = missing
+        return result
+    state = _read_smartsheet_state(cfg) if cfg.get("dedupe", True) else {"pushed": {}}
+    pushed = state.setdefault("pushed", {})
+    candidates = []
+    skipped = 0
+    for row in rows or []:
+        alert_id = str(row.get("告警ID") or "").strip()
+        if not alert_id:
+            skipped += 1
+            continue
+        if cfg.get("dedupe", True) and alert_id in pushed:
+            skipped += 1
+            continue
+        candidates.append(row)
+    result["skipped"] = skipped
+    if not candidates:
+        result["reason"] = "no_new_records"
+        return result
+    batch_size = max(1, min(500, int(cfg.get("batch_size") or 100)))
+    sent = 0
+    errors = []
+    record_ids = {}
+    for offset in range(0, len(candidates), batch_size):
+        batch = candidates[offset:offset + batch_size]
+        records = [_smartsheet_record(row, field_ids, field_types) for row in batch]
+        payload = {"add_records": records}
+        request = urllib.request.Request(
+            webhook_url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=int(cfg.get("timeout_seconds") or 15)) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+            ok = int(response_payload.get("errcode", -1)) == 0
+            if not ok:
+                errors.append({"offset": offset, "response": response_payload})
+                continue
+            added = response_payload.get("add_records") or []
+            now_text = dt_text(now_local())
+            for index, row in enumerate(batch):
+                alert_id = str(row.get("告警ID") or "").strip()
+                rec = added[index] if index < len(added) and isinstance(added[index], dict) else {}
+                record_id = rec.get("record_id") or ""
+                pushed[alert_id] = {
+                    "record_id": record_id,
+                    "time": now_text,
+                    "result": row.get("模型研判", ""),
+                    "source": source,
+                }
+                if record_id:
+                    record_ids[alert_id] = record_id
+            sent += len(batch)
+        except Exception as exc:
+            errors.append({"offset": offset, "error": str(exc)[:500]})
+    if cfg.get("dedupe", True) and sent:
+        _write_smartsheet_state(cfg, state)
+    result.update({
+        "sent": sent > 0 and not errors,
+        "partial": sent > 0 and bool(errors),
+        "records": sent,
+        "record_ids": record_ids,
+    })
+    if errors:
+        result["errors"] = errors[:5]
+        result["reason"] = "partial_error" if sent else "send_failed"
+    DATA_DIR.mkdir(exist_ok=True)
+    append_jsonl(
+        DATA_DIR / f"wecom-smartsheet-{now_local().strftime('%Y-%m-%d')}.jsonl",
+        [dict(result, recorded_at=dt_text(now_local()))],
+    )
+    return result
 
 
 def counter_text(counter, order=None, limit=6):
@@ -1119,11 +1481,14 @@ def _netflow_evidence_from_record(record):
 
 
 def _netflow_logs_for_record(config, record, start_text, end_text, limit=None):
-    """Fetch netflow_nta flows for this record's src IPs within the window.
+    """Fetch netflow_nta flows for this record's src/dst IPs within the window.
 
-    Filtered by src_ip to keep the query bounded (the raw index has tens of
-    millions of rows). Cached per (src_ip|window)."""
+    The dst filter is important: a busy gateway/node can generate many normal
+    business flows in the same window. Using only src_ip can attach unrelated
+    HTTP evidence to an alert.
+    """
     src_ips = [str(ip) for ip in (record.get("SrcIpList") or []) if str(ip)]
+    dst_ips = [str(ip) for ip in (record.get("DstIpList") or []) if str(ip)]
     if not src_ips:
         return []
     if limit is None:
@@ -1155,7 +1520,7 @@ def _netflow_logs_for_record(config, record, start_text, end_text, limit=None):
     client = build_client(config)
     out = []
     for src_ip in src_ips[:4]:
-        cache_key = f"netflow|{src_ip}|{start_text}|{end_text}"
+        cache_key = f"netflow|{src_ip}|{','.join(dst_ips[:10])}|{start_text}|{end_text}"
         if cache_key in _THREAT_WINDOW_CACHE:
             out.extend(_THREAT_WINDOW_CACHE[cache_key])
             continue
@@ -1180,7 +1545,14 @@ def _netflow_logs_for_record(config, record, start_text, end_text, limit=None):
             flt_http.Name = "app_protocol"
             flt_http.OperatorType = 1
             flt_http.Values = ["HTTP"]
-            req.Filters = [flt_ip, flt_http]
+            filters = [flt_ip, flt_http]
+            if dst_ips:
+                flt_dst = models.CommonFilter()
+                flt_dst.Name = "dst_ip"
+                flt_dst.OperatorType = 1
+                flt_dst.Values = dst_ips[:10]
+                filters.append(flt_dst)
+            req.Filters = filters
             resp = client.DescribeLogs(req)
             for rec in parse_data(resp.Data):
                 evidence = _netflow_evidence_from_record(rec)
@@ -1266,8 +1638,7 @@ def fetch_source_evidence_for_record(config, record, pad_minutes=10, limit=6):
     # 威胁日志查不到内网包,但 NTA 记录了完整内网 HTTP 请求/响应体。
     if not matched:
         netflow = _netflow_logs_for_record(config, record, window_start, window_end)
-        # 内网流量按 src_ip 匹配为主,dst 仅加权不强制(XFF/代理改写 dst)。
-        matched = _match(netflow, require_event=False, enforce_dst=False)
+        matched = _match(netflow, require_event=False, enforce_dst=True)
         source_tag = "netflow_nta"
 
     if not matched:
@@ -1539,6 +1910,8 @@ def normalize_direct_result(value):
         return "确认未成功"
     if value in ("扫描", "探测", "扫描探测"):
         return "扫描探测"
+    if value in ("转发", "转发重复", "转发重复告警", "网关转发", "二跳重复", "转发二跳"):
+        return "转发重复告警"
     if value in ("误报", "业务误报", "正常业务", "正常业务误报", "疑似误报", "业务正常"):
         return "业务误报"
     if value in ("复核", "疑似攻击", "封禁候选", "优先排查"):
@@ -2233,6 +2606,23 @@ TRIAGE_TOOLS = [
             "required": ["ip"],
         },
     },
+    {
+        "type": "function",
+        "name": "trace_forward_chain",
+        "description": (
+            "溯源容器/网关转发链路。用于内网源IP触发zgrab/扫描/漏洞告警时,按告警src+dst"
+            "精确取NTA下游证据,再反查同时间窗是否存在外部源以相同Host/UA/路径打到该内网源。"
+            "若命中,说明当前告警是外部扫描经网关/节点转发后的二跳重复告警,处置对象应为真实外部源,"
+            "不是内网中间节点。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "source_ip": {"type": "string", "description": "可选,观测到的告警源IP;不填使用告警SrcIpList"},
+                "target_ip": {"type": "string", "description": "可选,告警目标IP;不填使用告警DstIpList"},
+            },
+        },
+    },
 ]
 
 
@@ -2259,6 +2649,8 @@ def _tool_decode_hex(config, record, args):
 
 def _tool_get_related_alerts(config, record, args):
     ip = str(args.get("ip") or "")
+    if not ip:
+        ip = next((str(x) for x in (record.get("SrcIpList") or []) if str(x)), "")
     days = int(args.get("days") or 2)
     try:
         import cfw_alert_center_triage as triage
@@ -2277,7 +2669,7 @@ def _tool_get_related_alerts(config, record, args):
     return {"ip": ip, "count": len(related), "alerts": related[:15]}
 
 
-def _query_netflow_raw(config, ip, record=None, limit=15):
+def _query_netflow_raw(config, ip, record=None, limit=15, enforce_record_dst=False):
     """查 netflow_nta 该源IP的流量(任意协议),返回精简元数据列表。"""
     # 时间窗:优先用告警自身窗口,否则用近6小时
     def _parse(v):
@@ -2301,7 +2693,16 @@ def _query_netflow_raw(config, ip, record=None, limit=15):
         flt.Name = "src_ip"
         flt.OperatorType = 1
         flt.Values = [str(ip)]
-        req.Filters = [flt]
+        filters = [flt]
+        if enforce_record_dst:
+            dst_ips = [str(x) for x in ((record or {}).get("DstIpList") or []) if str(x)]
+            if dst_ips:
+                flt_dst = models.CommonFilter()
+                flt_dst.Name = "dst_ip"
+                flt_dst.OperatorType = 1
+                flt_dst.Values = dst_ips[:10]
+                filters.append(flt_dst)
+        req.Filters = filters
         resp = build_client(config).DescribeLogs(req)
         rows = []
         for r in parse_data(resp.Data):
@@ -2319,7 +2720,9 @@ _INFRA_HINTS = ("ingress", "oss", "gateway", "网关", "nginx", "proxy", "lb-", 
 
 def _tool_query_flow(config, record, args):
     ip = str(args.get("ip") or "")
-    flows = _query_netflow_raw(config, ip, record, limit=20)
+    if not ip:
+        ip = next((str(x) for x in (record.get("SrcIpList") or []) if str(x)), "")
+    flows = _query_netflow_raw(config, ip, record, limit=20, enforce_record_dst=True)
     if not flows or (len(flows) == 1 and flows[0].get("error")):
         return {"found": False, "note": "无流量记录", "raw": flows}
     # 汇总:目标实例、URL、端口
@@ -2385,6 +2788,133 @@ def _tool_check_ip_history(config, record, args):
             "total_alerts": sum(evs.values()), "seen_before": confirmed}
 
 
+def _trace_req_path(req_line):
+    parts = str(req_line or "").split()
+    if len(parts) < 2:
+        return ""
+    return parts[1].split("?", 1)[0].split("#", 1)[0]
+
+
+def _trace_best_public(src_ips):
+    for ip in src_ips or []:
+        ip = str(ip or "")
+        if valid_public_ip(ip):
+            return ip
+    return ""
+
+
+def _tool_trace_forward_chain(config, record, args):
+    observed_sources = [str(args.get("source_ip") or "").strip()] if args.get("source_ip") else []
+    if not observed_sources:
+        observed_sources = [str(ip) for ip in (record.get("SrcIpList") or []) if str(ip)]
+    targets = [str(args.get("target_ip") or "").strip()] if args.get("target_ip") else []
+    if not targets:
+        targets = [str(ip) for ip in (record.get("DstIpList") or []) if str(ip)]
+    if not observed_sources or not targets:
+        return {"found": False, "note": "缺少源IP或目标IP,无法做转发链路溯源"}
+
+    def _parse(value):
+        try:
+            return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            return None
+
+    start = _parse(record.get("StartTime"))
+    end = _parse(record.get("EndTime"))
+    if not start or not end:
+        return {"found": False, "note": "缺少告警时间窗,无法做转发链路溯源"}
+
+    sub = dict(record)
+    sub["SrcIpList"] = observed_sources[:4]
+    sub["DstIpList"] = targets[:10]
+    downstream = fetch_source_evidence_for_record(config, sub, pad_minutes=10, limit=3)
+    down_req = downstream.get("req", "")
+    down_host = str(downstream.get("host") or "")
+    down_ua = str(downstream.get("ua") or "")
+    down_path = _trace_req_path(down_req)
+
+    window_start = dt_text(start - timedelta(minutes=10))
+    window_end = dt_text(end + timedelta(minutes=10))
+    upstream_candidates = []
+    observed_set = set(observed_sources)
+    for item in _threat_logs_for_window(config, window_start, window_end):
+        root = _trace_best_public(item.get("src_ips") or [])
+        if not root:
+            continue
+        evidence = item.get("evidence") or {}
+        up_host = str(evidence.get("host") or "")
+        up_ua = str(evidence.get("ua") or "")
+        up_req = str(evidence.get("req") or "")
+        up_path = _trace_req_path(up_req)
+        dst_match = str(item.get("dst_ip") or "") in observed_set
+        host_match = down_host and up_host and down_host == up_host
+        ua_match = down_ua and up_ua and down_ua == up_ua
+        path_match = down_path and up_path and down_path == up_path
+        scanner_match = bool(re.search(r"zgrab|masscan|nmap|censys|shodan", down_ua + " " + up_ua, re.I))
+        if not dst_match and not (host_match and (ua_match or path_match or scanner_match)):
+            continue
+        score = 0
+        score += 60 if dst_match else 0
+        score += 25 if host_match else 0
+        score += 20 if ua_match else 0
+        score += 10 if path_match else 0
+        score += 10 if scanner_match else 0
+        upstream_candidates.append((score, {
+            "root_source_ip": root,
+            "dst_ip": item.get("dst_ip", ""),
+            "event": item.get("event_name", ""),
+            "time": item.get("time", ""),
+            "req": compact_text(up_req, 180),
+            "host": compact_text(up_host, 100),
+            "ua": compact_text(up_ua, 140),
+            "resp": compact_text(evidence.get("resp") or evidence.get("resp_hint") or "", 140),
+            "flow": evidence.get("flow", ""),
+            "match": {
+                "dst": dst_match,
+                "host": bool(host_match),
+                "ua": bool(ua_match),
+                "path": bool(path_match),
+                "scanner": bool(scanner_match),
+            },
+        }))
+    upstream_candidates.sort(key=lambda pair: pair[0], reverse=True)
+    upstream = upstream_candidates[0][1] if upstream_candidates else {}
+
+    downstream_edge = {
+        "src_ip": observed_sources[0],
+        "dst_ip": targets[0],
+        "req": compact_text(down_req, 180),
+        "host": compact_text(down_host, 100),
+        "ua": compact_text(down_ua, 140),
+        "resp": compact_text(downstream.get("resp") or downstream.get("resp_hint") or "", 140),
+        "resp_body": compact_text(downstream.get("resp_body") or "", 180),
+        "flow": downstream.get("flow", ""),
+    }
+    if upstream:
+        root = upstream.get("root_source_ip", "")
+        return {
+            "found": True,
+            "trace_type": "gateway_forward_duplicate",
+            "root_source_ip": root,
+            "observed_source_ip": observed_sources[0],
+            "target_ip": targets[0],
+            "disposition_target": root,
+            "summary": f"{root} -> {observed_sources[0]} -> {targets[0]}",
+            "upstream": upstream,
+            "downstream": downstream_edge,
+            "verdict_hint": "转发重复告警",
+            "note": "命中同Host/UA/路径的外部上一跳,当前内网源是中间节点/转发节点,不要封禁该内网源。",
+        }
+    return {
+        "found": False,
+        "trace_type": "single_observed_edge",
+        "observed_source_ip": observed_sources[0],
+        "target_ip": targets[0],
+        "downstream": downstream_edge,
+        "note": "未找到外部上一跳;只能按当前src->dst证据研判。",
+    }
+
+
 TOOL_DISPATCH = {
     "pull_packets": _tool_pull_packets,
     "decode_hex": _tool_decode_hex,
@@ -2392,6 +2922,7 @@ TOOL_DISPATCH = {
     "query_flow": _tool_query_flow,
     "identify_asset": _tool_identify_asset,
     "check_ip_history": _tool_check_ip_history,
+    "trace_forward_chain": _tool_trace_forward_chain,
 }
 
 
@@ -2414,17 +2945,22 @@ def _agent_request_body(model, input_items, reasoning_effort):
             "取证策略(重要):先 pull_packets 拉源包;若拉不到(常见于内网流量),"
             "不要就此判'未见证据',必须换招继续查:用 query_flow 看该IP真实流量的URL/端口/"
             "目标实例,用 identify_asset 看源和目标是什么资产,用 check_ip_history 看这IP历史行为。"
+            "若源IP是内网且事件/UA含zgrab、masscan、nmap、censys等扫描器,或目标资产含POD/"
+            "kubernetes/proxy/ingress/网关,必须调用 trace_forward_chain 做上一跳溯源。"
+            "若trace_forward_chain返回found=true,说明这是外部攻击经中间节点转发后的重复告警,"
+            "判result='转发重复告警',处置对象是root_source_ip,不要建议封禁observed_source_ip。"
             "结论必须明确区分'误报'和'真攻击未成功'这两类(它们都没得手,但本质不同):"
             "①业务误报 = 内网业务节点访问内网基础设施(ingress/oss/网关)、URL是正常业务路径"
             "(如 /v1/.../geo/conver、/marketing/... 这类接口)、请求参数是业务数据而非攻击载荷 → "
             "这是正常业务被IDS规则误命中,判 result='业务误报';"
             "②未见成功证据 = 请求里确实有攻击载荷(SQL注入串/命令/路径穿越/webshell上传等真实攻击特征),"
             "但响应未见得手 → 这是真有人在攻击只是没成,判 result='未见成功证据';"
-            "③确认未成功 = 真攻击且明确被拦/失败(WAF阻断/4xx);④扫描探测 = 外部扫描器探测特征。"
+            "③确认未成功 = 真攻击且明确被拦/失败(WAF阻断/4xx);④扫描探测 = 外部扫描器探测特征;"
+            "⑤转发重复告警 = 外部扫描/攻击经网关或节点转发后产生的内网二跳重复告警。"
             "关键区分点:看请求载荷是'业务数据'还是'攻击payload'——业务数据=误报,攻击payload但没回显=未见成功证据。"
             "只有命令回显/webshell/敏感数据外泄/异常回连/打数据库等落地证据才判确认成功或保留人工。"
             "得到足够证据后,只输出一个紧凑JSON对象(不要解释、不要数组),字段:"
-            "result(确认成功/确认未成功/未见成功证据/扫描探测/业务误报/需人工复核),"
+            "result(确认成功/确认未成功/未见成功证据/扫描探测/业务误报/转发重复告警/需人工复核),"
             "confidence(high/medium/low),evidence(判定依据,≤40汉字),"
             "next(下一步,≤20汉字),key_evidence(支撑结论的源包原文片段/流量URL/资产名,≤120字符,无则空串)。"
             "确认成功必须有命令回显/文件写入/webshell/敏感数据返回/回连等明确落地证据;"
@@ -2595,13 +3131,24 @@ def _parse_agent_final(text):
     if not isinstance(parsed, dict):
         return None
     result = normalize_direct_result(parsed.get("result") or parsed.get("模型研判"))
-    return {
+    out = {
         "模型研判": result,
         "模型置信度": normalize_confidence(parsed.get("confidence") or parsed.get("模型置信度")),
         "研判理由": str(parsed.get("evidence") or parsed.get("研判理由") or "")[:120],
         "下一步": str(parsed.get("next") or parsed.get("下一步") or "")[:80],
         "关键证据": str(parsed.get("key_evidence") or parsed.get("关键证据") or "")[:160],
     }
+    extras = {
+        "真实攻击源": parsed.get("root_source_ip") or parsed.get("真实攻击源"),
+        "观测源": parsed.get("observed_source_ip") or parsed.get("观测源"),
+        "中间节点": parsed.get("intermediate_asset") or parsed.get("中间节点"),
+        "处置对象": parsed.get("disposition_target") or parsed.get("处置对象"),
+        "链路类型": parsed.get("trace_type") or parsed.get("链路类型"),
+    }
+    for key, value in extras.items():
+        if value:
+            out[key] = str(value)[:160]
+    return out
 
 
 def _generic_agent_system():
@@ -2613,9 +3160,15 @@ def _generic_agent_system():
         "{\"tool_call\":{\"name\":\"工具名\",\"args\":{...},\"reason\":\"为什么调用\"}}。"
         f"可用工具:{tool_names}。"
         "若证据足够或已到最后一轮,输出最终结论 JSON:"
-        "{\"result\":\"确认成功/确认未成功/未见成功证据/扫描探测/业务误报/需人工复核\","
+        "{\"result\":\"确认成功/确认未成功/未见成功证据/扫描探测/业务误报/转发重复告警/需人工复核\","
         "\"confidence\":\"high/medium/low\",\"evidence\":\"≤40汉字\","
-        "\"next\":\"≤20汉字\",\"key_evidence\":\"≤120字符\"}。"
+        "\"next\":\"≤20汉字\",\"key_evidence\":\"≤120字符\","
+        "\"root_source_ip\":\"可选\",\"observed_source_ip\":\"可选\",\"disposition_target\":\"可选\","
+        "\"trace_type\":\"可选\"}。"
+        "若源IP是内网且事件/UA含zgrab、masscan、nmap、censys等扫描器,或目标资产含POD/"
+        "kubernetes/proxy/ingress/网关,必须先调用trace_forward_chain。"
+        "若trace_forward_chain返回found=true,输出result=转发重复告警,disposition_target填root_source_ip,"
+        "不要建议封禁observed_source_ip。"
         "必须基于工具结果中的真实证据判断;确认成功必须有命令回显、webshell、敏感数据返回、"
         "文件落地或回连等明确落地证据。单独 HTTP 200、普通页面、业务接口调用不算成功。"
         "业务误报=正常业务数据被规则误命中;未见成功证据=确有攻击 payload 但无得手证据。"
@@ -2727,7 +3280,15 @@ def source_review_enabled(config):
 
 def source_evidence(row):
     evidence = row.get("源包证据") or {}
-    return evidence if isinstance(evidence, dict) else {}
+    if isinstance(evidence, dict):
+        return evidence
+    if isinstance(evidence, str) and evidence.strip().startswith("{"):
+        try:
+            parsed = json.loads(evidence)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
 
 def source_group_key(row):
@@ -2765,6 +3326,8 @@ def has_success_source_evidence(row):
         return True
     if evidence.get("cmd"):
         return True
+    if has_es_write_success_evidence(evidence):
+        return True
     resp_mark = set(str(evidence.get("resp_mark") or "").split(","))
     success_marks = {"git_ref", "passwd", "phpinfo", "cmd_uid", "index_of", "webshell"}
     if resp_mark & success_marks:
@@ -2772,6 +3335,26 @@ def has_success_source_evidence(row):
     # 内网 NTA 抓到的响应体里若出现命令回显/敏感文件标记,也算成功证据
     body_marks = set(evidence_marker(str(evidence.get("resp_body") or "")).split(","))
     return bool(body_marks & success_marks)
+
+
+def has_es_write_success_evidence(evidence):
+    text = "\n".join(
+        str(evidence.get(key) or "")
+        for key in ("req", "resp", "resp_hint", "resp_body", "key_evidence", "log", "flow")
+    )
+    text_l = text.lower()
+    if not text_l:
+        return False
+
+    has_write_method = bool(re.search(r"\b(?:post|put)\s+", text_l)) or "_bulk" in text_l
+    has_es_endpoint = bool(re.search(r"/[^\s\"']*/_(?:bulk|doc)\b", text_l)) or "_bulk" in text_l
+    if not (has_write_method and has_es_endpoint):
+        return False
+
+    status_created = bool(re.search(r"\b201\b", text_l)) and "created" in text_l
+    json_created = bool(re.search(r"['\"]result['\"]\s*:\s*['\"]created['\"]", text_l))
+    item_created = "items" in text_l and bool(re.search(r"['\"]status['\"]\s*:\s*201", text_l))
+    return status_created or json_created or item_created
 
 
 def compact_source_review_row(row, index, max_chars):
@@ -2813,15 +3396,19 @@ def source_review_prompt(batch, id_map, max_chars):
         rows.append(compact_source_review_row(row, index, max_chars))
     return (
         "根据源包摘要复核云防火墙告警是否攻击成功，重点减少不必要人工复核。"
-        "结果只能取:确认成功,确认未成功,未见成功证据,扫描探测,业务误报,需人工复核。"
+        "结果只能取:确认成功,确认未成功,未见成功证据,扫描探测,业务误报,转发重复告警,需人工复核。"
         "业务误报=req是正常业务请求(业务URL/参数)被规则误命中、非攻击;"
         "未见成功证据=req含真实攻击载荷(注入串/命令/穿越/webshell)但未见得手。两者按 req 内容区分。"
         "判定规则: 有命令执行/文件写入/webshell/敏感数据返回/有效回显/回连才确认成功；"
+        "Kibana/Elasticsearch写入类请求(_bulk/_doc)若响应201 created或items中status=201/result=created,属于文件/数据写入成功证据；"
         "注意:req和req_mark只是攻击请求特征，不能单独作为成功证据；"
         "只有ar成功、cmd、resp_mark或响应内容体现成功时才能确认成功；"
         "单独HTTP 200、普通页面、ETag或哈希样字符串不是成功证据；"
         "响应为404/403/401、WAF阻断、无有效回显且只有利用尝试时确认未成功或未见成功证据；"
-        "目录扫描、敏感文件探测、zgrab/masscan/censys特征判扫描探测；"
+        "目录扫描、敏感文件探测、外部zgrab/masscan/censys探测判扫描探测；"
+        "若内网源只是外部扫描/攻击经网关或节点转发后的二跳,判转发重复告警;"
+        "但若源和目标都是内网/业务资产,req是明确业务URL和业务参数,响应也是正常业务数据,"
+        "即使事件名含zgrab/masscan/censys也优先判业务误报,不要被标签带偏；"
         "只有缺关键源包证据且确实高危才保留需人工复核。"
         "对高危(lv=高危)告警必须逐条审视响应体/命令回显,给出可复核的证据链,不要只给标签。"
         "只输出JSON数组，每项字段:id,result,confidence,evidence,next,key_evidence。"
@@ -2930,9 +3517,6 @@ def refine_judgements_with_source(config, rows, judgements, model):
         if not has_source_evidence(row):
             continue
         if not review_all and result != "需人工复核":
-            continue
-        # 首轮已高置信判定为纯扫描的,无需再花一轮(扫描器特征足够明确)。
-        if result == "扫描探测" and judgement.get("模型置信度") == "高":
             continue
         group_key = source_group_key(row)
         groups.setdefault(group_key, row)
@@ -3259,17 +3843,15 @@ def append_llm_error(provider, model, batch, exc):
 
 
 def apply_judgements(rows, judgements):
+    fields = (
+        "模型研判", "模型置信度", "研判理由", "关键证据", "下一步", "研判来源", "研判模型",
+        "工具轨迹", "真实攻击源", "观测源", "中间节点", "处置对象", "链路类型",
+        "输入Token", "输出Token", "推理Token",
+    )
     for row in rows:
         judgement = judgements.get(judgement_key(row)) or {}
-        row["模型研判"] = judgement.get("模型研判", "")
-        row["模型置信度"] = judgement.get("模型置信度", "")
-        row["研判理由"] = judgement.get("研判理由", "")
-        row["下一步"] = judgement.get("下一步", "")
-        row["研判来源"] = judgement.get("研判来源", "")
-        row["研判模型"] = judgement.get("研判模型", "")
-        row["输入Token"] = judgement.get("输入Token", "")
-        row["输出Token"] = judgement.get("输出Token", "")
-        row["推理Token"] = judgement.get("推理Token", "")
+        for field in fields:
+            row[field] = judgement.get(field, "")
     return rows
 
 

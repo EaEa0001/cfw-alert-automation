@@ -1,7 +1,6 @@
 /* ===== 视图：规则中心 ===== */
 (function () {
   const { esc } = CFW;
-  const CONFIRM_BLOCK = "CONFIRM_TENCENT_CFW_BLOCK";
   const LOG_KEY = "cfw.rule.actions.v1";
   let activePane = "library";
   let createMode = "manual";
@@ -22,7 +21,7 @@
           <div>
             <h2>规则中心</h2>
             <div class="rule-title">规则库、创建入口、默认白名单与执行记录分离管理</div>
-            <div class="mut small">黑名单负责外部处置，白名单负责研判抑制；封禁类规则生效时才会下发云防火墙。</div>
+            <div class="mut small">黑名单只记录人工封禁对象，白名单负责研判抑制；平台不自动调用腾讯云封禁。</div>
           </div>
           <div class="rule-tabs" role="tablist">
             ${tabButton("library", "规则库")}
@@ -36,7 +35,7 @@
       <div class="rule-kpis mt">
         ${statCard("全部规则", rules.length, "含系统默认规则")}
         ${statCard("生效中", stats.active, "正在参与实时研判")}
-        ${statCard("黑名单", stats.block, "生效时同步腾讯云封禁")}
+        ${statCard("黑名单", stats.block, "仅登记人工封禁对象")}
         ${statCard("白名单", stats.allow + stats.suppress, "扫描源与业务误报")}
       </div>
 
@@ -148,7 +147,7 @@
       <input id="manualReason" class="agent-input" value="${esc(manualForm.reason)}">
       <div class="rule-toolbar mt-sm">
         <button class="btn primary" id="manualDraftBtn">生成草案</button>
-        <span class="hint">黑名单只在确认生效时下发腾讯云；保存草案不会下发。</span>
+        <span class="hint">黑名单只登记对象，不自动下发腾讯云；封禁需人工执行。</span>
       </div>
     </div>`;
   }
@@ -200,7 +199,7 @@
           <button class="btn" data-save-rule="draft">保存草案</button>
           <button class="btn primary" data-save-rule="activate">确认生效</button>
         </div>
-        <span class="hint">${currentDraft.action === "block_ip" ? "确认生效会自动下发云防火墙黑名单。" : "生效后进入实时研判规则链路。"}</span>
+        <span class="hint">${currentDraft.action === "block_ip" ? "确认生效只登记人工封禁对象，不调用腾讯云。" : "生效后进入实时研判规则链路。"}</span>
       </div>
     </div>`;
   }
@@ -342,10 +341,10 @@
       CFW.renderLists();
       return;
     }
-    const shouldBlock = activate && currentDraft.action === "block_ip";
     if (activate) {
-      const message = shouldBlock
-        ? `确认让黑名单规则生效并自动下发云防火墙黑名单 ${blockIps(currentDraft).length} 个 IP？`
+      const isBlockRule = currentDraft.action === "block_ip";
+      const message = isBlockRule
+        ? `确认登记黑名单对象 ${blockIps(currentDraft).length} 个 IP？平台不会自动调用腾讯云封禁。`
         : "确认让这条自定义规则生效？生效后命中的告警会进入对应规则处理。";
       if (!confirm(message)) return;
     }
@@ -358,8 +357,6 @@
         body: JSON.stringify({
           rule: persistedDraft(currentDraft),
           activate,
-          auto_tencent_block: shouldBlock,
-          confirm: shouldBlock ? CONFIRM_BLOCK : "",
         })
       });
       lastResult = await res.json();
@@ -377,10 +374,10 @@
     const decoded = decodeURIComponent(ruleId || "");
     const rules = Array.isArray(CFW.DEMO.customRules) ? CFW.DEMO.customRules : [];
     const rule = rules.find(r => r.rule_id === decoded) || {};
-    const shouldBlock = action === "activate" && rule.action === "block_ip";
     if (action === "activate") {
-      const message = shouldBlock
-        ? `确认让黑名单规则生效并自动下发云防火墙黑名单 ${blockIps(rule).length} 个 IP？`
+      const isBlockRule = rule.action === "block_ip";
+      const message = isBlockRule
+        ? `确认登记黑名单对象 ${blockIps(rule).length} 个 IP？平台不会自动调用腾讯云封禁。`
         : "确认让这条规则生效？";
       if (!confirm(message)) return;
     }
@@ -389,10 +386,7 @@
       const res = await fetch(`/api/agent/rules/${encodeURIComponent(decoded)}/${action}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          auto_tencent_block: shouldBlock,
-          confirm: shouldBlock ? CONFIRM_BLOCK : "",
-        })
+        body: JSON.stringify({})
       });
       lastResult = await res.json();
       pushActionLog(action === "activate" ? "规则生效" : "规则禁用", describeRule(lastResult).summary);
@@ -476,7 +470,7 @@
     const type = String(rule?.type || "");
     const target = ruleTarget(rule);
     if (action === "block_ip" || type === "ip_blocklist") {
-      return { kind: "攻击源黑名单", tone: "danger", target, action: "腾讯云封禁", summary: `封禁来源 ${target}` };
+      return { kind: "攻击源黑名单", tone: "danger", target, action: "人工封禁登记", summary: `登记封禁来源 ${target}` };
     }
     if (action === "allow_scanner_ip" || type === "scanner_whitelist") {
       return { kind: "扫描源白名单", tone: "ok", target, action: "标记扫描源", summary: `受控扫描源 ${target}` };
@@ -509,7 +503,7 @@
   function syncStatus(rule) {
     if (rule?.action !== "block_ip") return "不需要";
     const res = rule?._tencent_block_result || {};
-    return res.status || (rule.status === "active" ? "需确认记录" : "未下发");
+    return res.status || (rule.status === "active" ? "待人工确认" : "未生效");
   }
 
   function persistedDraft(draft) {
